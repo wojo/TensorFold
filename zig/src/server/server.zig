@@ -23,9 +23,13 @@ const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
 const recipe_mod = @import("recipe.zig");
+const prepare_gate = @import("prepare_gate.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
+
+/// A kept-alive connection's arena keeps at most this much between its requests.
+const connection_keep: usize = 1 << 20;
 
 /// auto compacts near the window. fraction compacts past that share of it.
 pub const CompactAt = union(enum) { auto, fraction: f64 };
@@ -58,6 +62,9 @@ pub const Config = struct {
     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
     slide_graph: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
+    /// TENSORFOLD_PREPARE_FLOOR_GIB: the MemAvailable a prompt's render and tokenization leave at least while others
+    /// are in flight (prepare_gate); 0: no gate.
+    prepare_floor_gib: f64 = prepare_gate.default_floor_gib,
     /// The GLM recipe's switches (TF_GLM_*), read at start; `recipe.glm` turns its server behaviours on.
     recipe: recipe_mod.Recipe = .{},
 };
@@ -92,6 +99,8 @@ pub const Server = struct {
     kept_reasoning: ?*@import("glm_kept.zig").KeptReasoning = null,
     /// Requests the engine holds now, running or waiting, background ones included (admission.zig).
     in_system: std.atomic.Value(u32) = .init(0),
+    /// Concurrent prompt preparations held under the memory floor (prepare_gate).
+    gate: prepare_gate.Gate = .{},
     arena: std.heap.ArenaAllocator,
     /// --vision: the helper that prepares picture and clip prompts (null: text only)
     vision: ?*@import("vision_server.zig").Vision = null,
@@ -109,7 +118,7 @@ pub const Server = struct {
         @import("glm_keys.zig").enabled = config.recipe.glm; // a missing <arg_key> is put back by the end parser
         errors.capacity_status = if (config.recipe.glm) 429 else 503; // the recipe: 429 + Retry-After: 5, not a bare 503 (patch 0081)
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .gate = .init(config.prepare_floor_gib), .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
                 log.line("idle keepalive off: {s}", .{@errorName(e)});
@@ -336,7 +345,9 @@ pub const Server = struct {
         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
         defer arena.deinit();
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            // a kept-alive connection keeps at most this much of its last request between requests (a long prompt's
+            // text and ids are tens of MiB, and retain_capacity held them until the connection closed)
+            _ = arena.reset(.{ .retain_with_limit = connection_keep });
             const a = arena.allocator();
             const outcome = conn.readRequest(a, true) catch break;
             switch (outcome) {
@@ -348,6 +359,7 @@ pub const Server = struct {
             if (conn.header("Expect")) |expect| if (std.ascii.eqlIgnoreCase(expect, "100-continue") and std.mem.order(u8, conn.version, "HTTP/1.1") != .lt) conn.sendContinue();
             routes.dispatch(srv, &conn, a);
             if (conn.close or conn.broken) break;
+            _ = arena.reset(.{ .retain_with_limit = connection_keep }); // (before waiting for the next request)
         }
     }
 
