@@ -232,6 +232,15 @@ const Host = struct {
         h.host.cache = h.store;
         // GLM vision: TF_GLM_IMAGE_MARK_SNAP=1 keeps no state cut inside a picture (LaneHost.mark_snap)
         if (info.media) h.host.mark_snap = api.prompt_cache.markSnapOn(getenv("TF_GLM_IMAGE_MARK_SNAP"));
+        // GLM's TF_GLM_FILL: a request whose prompt shares a cut another fill is still computing waits for it
+        // (TF_GLM_PREFIX_WAIT, TF_GLM_PREFIX_WAIT_MS: LaneHost.prefixWait; rank 0's admission alone, nothing to agree)
+        if (h.core.slices() and h.store != null) {
+            h.host.prefix_wait_ns = api.LaneHost.prefixWaitSetting(getenv("TF_GLM_PREFIX_WAIT"), getenv("TF_GLM_PREFIX_WAIT_MS")) catch |e| {
+                std.log.err("TF_GLM_PREFIX_WAIT: 1 (the default) or 0; TF_GLM_PREFIX_WAIT_MS: whole milliseconds ({d} by default; 0 off)", .{api.LaneHost.prefix_wait_default_ms});
+                return e;
+            };
+            if (h.host.prefix_wait_ns > 0) std.log.info("TF_GLM_FILL: a prompt sharing a cut another prompt is filling waits for it, {d} ms at most (TF_GLM_PREFIX_WAIT)", .{@divTrunc(h.host.prefix_wait_ns, std.time.ns_per_ms)});
+        }
         if (h.spill) |sp| h.host.configure(sp); // (after the tier is set: it publishes telemetry only over one)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         if (h.learn != null) h.host.learner = h.learner();
