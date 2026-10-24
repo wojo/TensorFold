@@ -786,10 +786,13 @@ fn secSwitches(t: *T) !void {
     t.check("refuse: two ranks only", R.refused(on, 1, 4, false, error.KvShardNeedsTwoRanks) and R.refused(on, 4, 4, false, error.KvShardNeedsTwoRanks));
     t.check("refuse: more than one stream", R.refused(on, 2, 1, false, error.KvShardNeedsParallel));
     t.check("refuse: no MTP drafter", R.refused(on, 2, 2, true, error.KvShardWithMtp));
-    t.check("refuse: no TF_GLM_MULTI_LONE", R.refused(set, 2, 8, false, error.KvShardWithLone));
+    // TF_GLM_MULTI_LONE=1 (the Python fork's lone-stream decode, which this engine does not have) is a warning, not a refusal
+    const lone_ok = if (shard.refuse(set, 2, 8, false)) |_| true else |_| false;
+    t.check("refuse: TF_GLM_MULTI_LONE=1 is no refusal, a warning that it does nothing here", lone_ok and std.mem.indexOf(u8, shard.warning(set) orelse "", "does nothing on the Zig engine") != null);
+    t.check("refuse: no warning without TF_GLM_MULTI_LONE=1 or with sharding off", shard.warning(on) == null and shard.warning(off) == null and shard.warning(.{ .lone = true }) == null);
     t.check("refuse: two ranks, streams, DFlash2 or no drafts", if (shard.refuse(on, 2, 8, false)) |_| true else |_| false);
     var worded = true;
-    for ([_]anyerror{ error.BadKvShard, error.BadKvShardCarry, error.BadKvShardTwins, error.BadKvShardCheck, error.KvShardNeedsTwoRanks, error.KvShardNeedsParallel, error.KvShardWithMtp, error.KvShardWithLone, error.KvShardNotBuilt, error.NoKvShardKernels }) |e| worded = worded and shard.why(e) != null;
+    for ([_]anyerror{ error.BadKvShard, error.BadKvShardCarry, error.BadKvShardTwins, error.BadKvShardCheck, error.KvShardNeedsTwoRanks, error.KvShardNeedsParallel, error.KvShardWithMtp, error.KvShardNotBuilt, error.NoKvShardKernels }) |e| worded = worded and shard.why(e) != null;
     t.check("refuse: every refusal in words", worded and shard.why(error.OutOfMemory) == null and std.mem.indexOf(u8, shard.why(error.NoKvShardKernels).?, "glm_shard.fatbin") != null);
     t.check("refuse: this build carries the GPU paths", shard.gpu_paths);
     // glm_shard.cu's image is optional in the build: one that embeds kernels without it refuses sharding at start

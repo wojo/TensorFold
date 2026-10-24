@@ -23,6 +23,7 @@ test {
     _ = @import("cuda_shard_decode_test.zig");
     _ = shard_prompt;
     _ = @import("cuda_shard_prompt_test.zig");
+    _ = @import("cuda_aot_coverage_test.zig");
     _ = shard_keep;
     _ = @import("cuda_shard_keep_test.zig");
     _ = segments;
