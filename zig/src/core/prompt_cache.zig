@@ -700,6 +700,23 @@ pub const Store = struct {
         return best;
     }
 
+    /// The fewest tokens a cut another pass is still computing must add past a request's own hit for the request to
+    /// wait for it (LaneHost's prefix wait): the recipe's shared-prefix rule (`shared_least`; 0, TF_GLM_SHARED_PREFIX=0:
+    /// no shared cuts are kept, so none is waited for), else the marks' own spacing (min_gap).
+    pub fn waitLeast(s: *const Store) u32 {
+        if (s.policy.recipe) return s.policy.shared_least;
+        return @max(s.rules.min_gap, 1);
+    }
+
+    /// Whether a state another pass will keep at `at` of `kept` (its key, with `kept_spans`) would serve `prompt`
+    /// as `find` serves a kept one: eligible here (a row left, its lookahead inside, on this request's chunk starts),
+    /// the same tokens through its lookahead and the same canonical spans through `at`.
+    pub fn wouldServe(s: *const Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, kept: []const u32, kept_spans: []const modes.Span, at: u32) bool {
+        const n = @as(usize, at) + s.rules.lookahead;
+        if (!s.eligible(at, prompt.len, starts) or n > kept.len) return false;
+        return std.mem.eql(u32, prompt[0..n], kept[0..n]) and modes.equal(kept_spans, spans, at);
+    }
+
     /// Find a kept token prefix with matching canonical spans through its position, leaving at least one row.
     pub fn find(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?*Entry {
         var best: ?*Entry = null;

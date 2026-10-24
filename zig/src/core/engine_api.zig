@@ -585,6 +585,7 @@ test {
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("lane_host_warm_test.zig");
     _ = @import("lane_host_tier_test.zig");
+    _ = @import("lane_host_prefix_test.zig");
     _ = @import("prompt_cache_media_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_media.zig");
