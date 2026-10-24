@@ -53,6 +53,9 @@ pub const LaneHost = struct {
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+    /// TF_GLM_IMAGE_MARK_SNAP=1 (prompt_cache.markSnapOn): a pass over pictures keeps no state whose cut falls inside one
+    /// (prompt_media.snapMarks: back to the grid at its start), so no resume runs the tower again on a picture half kept
+    mark_snap: bool = false,
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
@@ -157,14 +160,16 @@ pub const LaneHost = struct {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
             if (job.host.cache) |store| {
-                _ = store.keepWith(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request), job.keepInfo());
+                _ = store.keepWith(keyOf(job.request), at, s, job.request.chunks, job.host.spans(job.request), job.keepInfo());
                 status.noteKept(job.host);
             }
         }
 
         /// What its keeps record: its conversation, the point its pass resumed and the pass's lineage.
         fn keepInfo(job: *const Job) pc.KeepInfo {
-            return .{ .chat = job.join.chat, .parent = job.parent, .fork = job.fork, .lineage = job.lineage };
+            const r = job.request;
+            const pics = r.media != null; // (the tier records each picture's identity and the prompt's model ids)
+            return .{ .chat = job.join.chat, .parent = job.parent, .fork = job.fork, .lineage = job.lineage, .images = pics, .media = if (pics) tierMedia(r) else &.{}, .raw = if (pics) r.prompt else &.{} };
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -184,9 +189,30 @@ pub const LaneHost = struct {
                     job.lineage = fresh;
                 }
             }
-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (ok) store.resumed(e, job.request.prompt, true);
+            if (job.stream.reuse_failed) store.resumed(e, keyOf(job.request), false) else if (ok) store.resumed(e, keyOf(job.request), true);
         }
     };
+
+    /// The ids the prompt cache keys a request by: its prompt, or with pictures the prompt with each picture's rows made
+    /// from its content (Request.cache_key).
+    pub fn keyOf(r: *const Request) []const u32 {
+        return if (r.media != null and r.cache_key.len == r.prompt.len) r.cache_key else r.prompt;
+    }
+
+    /// Whether the cache may serve or keep a request: without pictures always; with them only when the server keyed
+    /// them and their identities name exactly the rows the engine fills (`tierMedia`).
+    pub fn cacheable(r: *const Request) bool {
+        return r.media == null or (r.cache_key.len == r.prompt.len and tierMedia(r).len > 0);
+    }
+
+    /// The pictures' identities a request's cache keys and tier records hold: its `cache_media` only when they name
+    /// exactly the spans the engine fills (prompt_media.spansMatch: item i's rows are media i's span), one for one;
+    /// anything else gives none, and the request is then neither kept nor resumed (a hit must not resume pictures
+    /// placed elsewhere than its state recorded them).
+    pub fn tierMedia(r: *const Request) []const pc.Media {
+        const m = r.media orelse return &.{};
+        return if (pc.prompt_media.spansMatch(m, r.cache_media)) r.cache_media else &.{};
+    }
 
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
@@ -457,13 +483,15 @@ pub const LaneHost = struct {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        // a prompt with pictures or clips is neither resumed nor kept
-        if (r.media == null) if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        // a prompt with pictures or clips is resumed and kept only by its content key (cacheable)
+        if (cacheable(r)) if (h.cache) |store| if (store.lookupRewind(h.gpa, keyOf(r), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
-            reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
-            job.join = store.join(r.prompt, l.entry, r.drafts);
+            const resume_at: u32 = if (l.entry) |e| e.at else 0;
+            const marks = if (h.mark_snap and r.media != null) pc.prompt_media.snapMarks(@constCast(l.marks), resume_at, tierMedia(r), store.rules.grid) else l.marks;
+            reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = resume_at, .marks = marks, .hook = .{ .ptr = job, .at = Job.kept } };
+            job.join = store.join(keyOf(r), l.entry, r.drafts and r.media == null);
             if (l.entry) |e| {
                 job.parent = e.point;
                 job.fork = e.at;
@@ -737,7 +765,9 @@ pub const LaneHost = struct {
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = store.keepWith(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.keepInfo());
+        if (cacheable(job.request)) if (h.cache) |store| {
+            _ = store.keepWith(keyOf(job.request), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.keepInfo());
+        };
         status.noteKept(h);
         be.release(&job.stream);
         h.remove(job);
@@ -1003,9 +1033,10 @@ pub const LaneHost = struct {
     fn parkOwn(h: *LaneHost, job: *Job) bool {
         const store = h.cache orelse return false;
         const r = job.request;
-        if (job.tried_disk or r.media != null) return false;
+        if (job.tried_disk or !cacheable(r)) return false;
         const rows = h.spans(r);
-        const probe = store.probe(r.prompt, r.chunks, rows);
+        const key = keyOf(r);
+        const probe = store.probeMedia(key, r.chunks, rows, r.media != null, tierMedia(r));
         const p = probe.durable orelse return false;
         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
         if (h.entryHeld()) return h.holdOff(job, now);
@@ -1016,7 +1047,7 @@ pub const LaneHost = struct {
         room catch return false;
         // (the best memory state stays while the budget holds it beside the restore: refused, the pass resumes it; a
         // full tier, or a point the tier's check refuses, is refused before any room is made)
-        const begun = store.restoreBeginOver(p, r.prompt, .{ .have = probe.memory, .again = job.deferred_since != null });
+        const begun = store.restoreBeginOver(p, key, .{ .have = probe.memory, .again = job.deferred_since != null });
         status.noteKept(h); // (its room may have evicted kept states, begun or not)
         if (begun) |rs| {
             h.lock();
@@ -1027,7 +1058,7 @@ pub const LaneHost = struct {
             job.waited = true;
             return true;
         } else |err| {
-            const left = store.find(r.prompt, r.chunks, rows); // (the room may have evicted probe.memory: never read it now)
+            const left = store.find(key, r.chunks, rows); // (the room may have evicted probe.memory: never read it now)
             if (h.deferRestore(job, p, left, err, now)) return true;
             if (left) |e| {
                 note("reading {d} kept tokens from disk did not start ({s}); resuming the {d} memory holds", .{ p.at, @errorName(err), e.at });
@@ -1049,7 +1080,7 @@ pub const LaneHost = struct {
         const store = h.cache orelse return false;
         if (job.waited or h.loading.items.len == 0 or h.tier.hold_min == 0 or h.tier.defer_ns <= 0 or !h.wholePasses()) return false;
         const r = job.request;
-        const have: u32 = if (r.media != null) 0 else if (store.find(r.prompt, r.chunks, h.spans(r))) |e| e.at else 0;
+        const have: u32 = if (!cacheable(r)) 0 else if (store.find(keyOf(r), r.chunks, h.spans(r))) |e| e.at else 0;
         if (r.prompt.len -| have < h.tier.hold_min) return false;
         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
         const first = job.held_since orelse now;

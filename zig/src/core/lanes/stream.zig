@@ -197,7 +197,7 @@ pub const MediaItem = struct {
 
 /// A prompt's pictures and clips (GLM vision): the prompt rows the tower's features replace (ascending), and either
 /// the features already encoded (bf16 [rows.len, width]) or the canvases for the engine's own tower. A prompt with
-/// media is neither kept nor resumed, and prefills alone.
+/// media prefills alone; it is kept and resumed only under its content key (engine_api.Request.cache_key).
 pub const Media = struct {
     rows: []const u32,
     width: u32 = 4096,
@@ -206,6 +206,19 @@ pub const Media = struct {
     items: []const MediaItem = &.{},
     /// a following rank's copy (two ranks): the feature rows' count only; rows and features arrive by rank 0's broadcast
     follower_rows: u32 = 0,
+
+    /// What a prefill resuming at `cut` needs the tower for: the first item with a row at or past `cut` (every later
+    /// one too: rows ascend) and that item's first feature row. Items wholly before the cut need no tower run: their
+    /// rows are in the restored state and no chunk reads their features.
+    pub fn neededFrom(m: *const Media, cut: usize) struct { item: usize, row: usize } {
+        var row: usize = 0;
+        for (m.items, 0..) |it, i| {
+            const n = it.rows();
+            if (n > 0 and row + n <= m.rows.len and m.rows[row + n - 1] >= cut) return .{ .item = i, .row = row };
+            row += n;
+        }
+        return .{ .item = m.items.len, .row = row };
+    }
 
     pub fn rowCount(m: *const Media) usize {
         return if (m.follower_rows > 0) m.follower_rows else m.rows.len;
@@ -660,6 +673,21 @@ test "call gate in commit: observe follows committed tokens" {
     try std.testing.expectEqual(@as(?usize, 0), s.gateCut(&.{9}));
     _ = try s.commit(gpa, &.{50}, &.{});
     try std.testing.expect(!s.gateWatching());
+}
+
+test "neededFrom: the tower runs from the first item a row past the cut needs" {
+    const px: [3 * 28 * 56]u8 = @splat(1);
+    const items = [_]MediaItem{ .{ .h = 28, .w = 56, .data = &px }, .{ .h = 28, .w = 56, .data = &px }, .{ .h = 28, .w = 56, .data = &px } };
+    const rows = [_]u32{ 10, 11, 20, 21, 30, 31 };
+    const m: Media = .{ .rows = &rows, .items = &items };
+    try std.testing.expectEqual(@as(usize, 0), m.neededFrom(0).item); // a fresh prefill: every item
+    try std.testing.expectEqual(@as(usize, 0), m.neededFrom(11).item); // the first straddles the cut: all of it again
+    const after = m.neededFrom(12); // the first wholly before the cut
+    try std.testing.expect(after.item == 1 and after.row == 2);
+    const last = m.neededFrom(22);
+    try std.testing.expect(last.item == 2 and last.row == 4);
+    const none = m.neededFrom(32); // every picture before the cut: no tower run
+    try std.testing.expect(none.item == 3 and none.row == 6);
 }
 
 test "media rows and canvases must cover the prompt" {

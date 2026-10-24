@@ -9,6 +9,16 @@ const Allocator = std.mem.Allocator;
 const imprint = @import("prompt_imprint.zig");
 const modes = @import("cache_modes.zig");
 const learned = @import("prompt_learn.zig");
+const media_mod = @import("prompt_media.zig");
+
+// pictures (prompt_media.zig): content keys and their identities
+pub const Media = media_mod.Media;
+pub const picture_ids = media_mod.picture_ids;
+pub const pictureId = media_mod.pictureId;
+pub const mediaKeys = media_mod.mediaKeys;
+pub const imageCacheOn = media_mod.imageCacheOn;
+pub const markSnapOn = media_mod.markSnapOn;
+pub const prompt_media = media_mod;
 
 /// A family's copy of one state.
 pub const Saved = *anyopaque;
@@ -176,6 +186,7 @@ pub const Entry = struct {
     spilled: bool = false, // the family stored it on disk already (an early write)
     point: ?u64 = null, // its durable point in the tier (written at keep, or restored from)
     lineage: []Fork = &.{}, // the computation its rows belong to (store-owned; empty without a tier)
+    images: bool = false, // its key holds pictures' ids: never a conversation's continuation (0111), never in v1's disk tier
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0, chats_continued: u64 = 0, chats_continued_prefill_tokens: u64 = 0 };
@@ -246,6 +257,11 @@ pub const Want = struct {
     /// A planned family's request chunk starts: a point must stand on one (empty: `grid` decides).
     starts: []const u32 = &.{},
     lookahead: u32 = 0,
+    /// The prompt holds pictures, and each one's identity (every picture, in prompt order; see `Media`). A point
+    /// holding pictures matches only when every picture before its cut has the same span and canvas digest; a prompt
+    /// whose picture ids `media` does not account for (`mediaKeys`) finds nothing.
+    images: bool = false,
+    media: []const Media = &.{},
 };
 
 /// A kept state the tier writes (enqueued at keep). `saved` stays the family's: the tier reads it until `release`.
@@ -266,6 +282,12 @@ pub const Write = struct {
     /// The computation its rows belong to (0110's lineage; block names are salted with it), valid during the call:
     /// set whether or not the resumed state was ever written, so sibling forks name their shared blocks alike.
     lineage: []const Fork = &.{},
+    /// Its key holds pictures' ids: each picture's identity (every picture of the prompt, in order; the tier records
+    /// those before `at`) and the prompt's model ids (the placeholder at a picture's rows; at least `at` of them), valid
+    /// during the call. A picture before `at` that `media` does not name keeps nothing on disk.
+    images: bool = false,
+    media: []const Media = &.{},
+    raw: []const u32 = &.{},
 };
 
 /// One step of a state's lineage: computation `name` produced the rows from `at` on (the first step's `at` is 0). A
@@ -506,6 +528,10 @@ pub const KeepInfo = struct {
     parent: ?u64 = null, // the point of the state its pass resumed from (null: none, or never written)
     fork: u32 = 0, // where that pass resumed
     lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
+    /// its key holds pictures' ids: each one's identity and the prompt's model ids (Write's, for the tier)
+    images: bool = false,
+    media: []const Media = &.{},
+    raw: []const u32 = &.{},
 };
 
 pub const Store = struct {
@@ -582,7 +608,7 @@ pub const Store = struct {
     /// conversation does not hold it (multi.py `_superseded`).
     fn evict(s: *Store, i: usize, to_disk: bool) void {
         const e = s.entries.items[i];
-        if (to_disk and s.spills() and !e.spilled) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
+        if (to_disk and s.spills() and !e.spilled and !e.images) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
         s.remove(i);
     }
 
@@ -688,6 +714,12 @@ pub const Store = struct {
     /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point
     /// (none for a request that names decoded rows: a point holds prefill arithmetic only).
     pub fn probe(s: *Store, key: []const u32, starts: []const u32, spans: []const modes.Span) Probe {
+        return s.probeMedia(key, starts, spans, false, &.{});
+    }
+
+    /// `probe` for a prompt with pictures: `images` (it holds some) and each one's identity go to the tier's lookup
+    /// (Want.images, Want.media), so a point is found only for the same pictures in the same places.
+    pub fn probeMedia(s: *Store, key: []const u32, starts: []const u32, spans: []const modes.Span, images: bool, media: []const Media) Probe {
         const m = s.find(key, starts, spans);
         const t = s.tier orelse return .{ .memory = m };
         if (spans.len > 0) return .{ .memory = m };
@@ -703,6 +735,8 @@ pub const Store = struct {
             .grid = if (s.rules.planned and !planned_starts) s.rules.grid else 0,
             .starts = if (planned_starts) starts else &.{},
             .lookahead = s.rules.lookahead,
+            .images = images,
+            .media = media,
         };
         const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
         if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
@@ -870,7 +904,9 @@ pub const Store = struct {
             return s.unadopted(saved);
         };
         s.clock += 1;
-        e.* = .{ .tokens = tokens, .at = r.point.at, .saved = saved, .bytes = bytes, .born = @intCast(r.key.len), .used = s.clock, .last = last, .shared = r.point.shared, .chat = s.newChat(r.key.len), .own = false, .point = r.point.id, .lineage = lin };
+        e.* = .{ .tokens = tokens, .at = r.point.at, .saved = saved, .bytes = bytes, .born = @intCast(r.key.len), .used = s.clock, .last = last, .shared = r.point.shared, .chat = s.newChat(r.key.len), .own = false, .point = r.point.id, .lineage = lin, .images = for (tokens) |id| {
+            if (id >= picture_ids) break true;
+        } else false };
         s.entries.append(s.gpa, e) catch {
             e.point = null; // the point stays the tier's; only the memory copy goes
             s.free(e);
@@ -1231,7 +1267,7 @@ pub const Store = struct {
             return s.fail(at, error.OutOfMemory);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared, .lineage = lin };
+        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared, .lineage = lin, .images = info.images };
         owns_decoded = false;
         s.entries.append(s.gpa, e) catch {
             s.free(e);
@@ -1240,7 +1276,7 @@ pub const Store = struct {
         s.held += charged;
         s.counts.kept += 1;
         if (s.tier) |t| if (e.decode_spans.len == 0) { // write at keep: the tier stages the state's bytes between rounds
-            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = s.groupOf(chat), .shared = shared, .parent = info.parent, .fork = info.fork, .lineage = lin });
+            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = s.groupOf(chat), .shared = shared, .parent = info.parent, .fork = info.fork, .lineage = lin, .images = info.images, .media = info.media, .raw = info.raw });
             if (e.point != null) s.tier_stats.writes_enqueued += 1;
         };
         if (shared) learned.learn(s, e, starts);
@@ -1317,7 +1353,7 @@ pub const Store = struct {
         const i = s.capVictim(null, true) orelse return;
         const e = s.entries.items[i];
         e.spilled = true;
-        if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
+        if (!s.superseded(e) and !e.images) f(s.family.ptr, e.saved, e.tokens, e.at);
     }
 
     /// A clean stop: every state not stored yet is stored, newest first, until `max_ns` have passed (v1's disk tier; a
@@ -1330,7 +1366,7 @@ pub const Store = struct {
         var n: u32 = 0;
         while (true) {
             var best: ?*Entry = null;
-            for (s.entries.items) |e| if (!e.spilled and !s.superseded(e) and (best == null or e.used > best.?.used)) {
+            for (s.entries.items) |e| if (!e.spilled and !e.images and !s.superseded(e) and (best == null or e.used > best.?.used)) {
                 best = e;
             };
             const e = best orelse break;
@@ -1465,7 +1501,7 @@ pub const Store = struct {
     pub fn continuedChat(s: *const Store, prompt: []const u32) ?*Entry {
         var best: ?*Entry = null;
         for (s.entries.items) |c| {
-            if (!ownTurn(c)) continue;
+            if (!ownTurn(c) or c.images) continue; // (a picture state's ids are its pictures': no continuation evidence)
             const root = s.roots.get(c.chat) orelse continue;
             const n = @as(usize, root) + chat_match;
             if (c.tokens.len < n or prompt.len < n or c.tokens[n - 1] != prompt[n - 1] or !std.mem.eql(u32, c.tokens[0..n], prompt[0..n])) continue;

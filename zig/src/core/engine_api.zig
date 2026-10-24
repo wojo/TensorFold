@@ -91,8 +91,15 @@ pub const Request = struct {
     decide: ?u32 = null,
     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
     logprobs: ?u8 = null,
-    /// The prompt's pictures and clips (``Info.media`` engines only); such a prompt is never kept or resumed.
+    /// The prompt's pictures and clips (``Info.media`` engines only); without `cache_key` such a prompt is never kept or
+    /// resumed.
     media: ?*const Media = null,
+    /// With `media`: the prompt as the prompt cache keys it, one id a token, each picture's positions made from its
+    /// content (prompt_cache.pictureId: two pictures never share a kept state, one picture always does); empty: the
+    /// media are not keyed (TF_GLM_IMAGE_CACHE=0, features from another tower) and the prompt is neither kept nor resumed.
+    cache_key: []const u32 = &.{},
+    /// With `cache_key`: each item's identity (its span and the full SHA-256 its cache ids derive from), in prompt order.
+    cache_media: []const prompt_cache.Media = &.{},
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -578,7 +585,9 @@ test {
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("lane_host_warm_test.zig");
     _ = @import("lane_host_tier_test.zig");
+    _ = @import("prompt_cache_media_test.zig");
     _ = @import("prompt_cache.zig");
+    _ = @import("prompt_media.zig");
     _ = @import("prompt_radix.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");

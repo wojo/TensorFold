@@ -230,6 +230,8 @@ const Host = struct {
         if (h.read_status != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
         h.host.kv_parts = h.kv_parts;
         h.host.cache = h.store;
+        // GLM vision: TF_GLM_IMAGE_MARK_SNAP=1 keeps no state cut inside a picture (LaneHost.mark_snap)
+        if (info.media) h.host.mark_snap = api.prompt_cache.markSnapOn(getenv("TF_GLM_IMAGE_MARK_SNAP"));
         if (h.spill) |sp| h.host.configure(sp); // (after the tier is set: it publishes telemetry only over one)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         if (h.learn != null) h.host.learner = h.learner();
