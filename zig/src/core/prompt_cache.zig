@@ -344,6 +344,8 @@ pub const TierCounts = struct {
     dropped_temporaries: u64 = 0, // incomplete records removed at start
     points_part0: u64 = 0, // gauge: KV sharding (an owner-sharded store): published points whose home is part 0
     points_part1: u64 = 0, // gauge: ... part 1
+    pictures_kept: u64 = 0, // points written with pictures before their cut (each rank its own)
+    pictures_refused: u64 = 0, // keeps and lookups with pictures turned away: ids and media disagree, or image cache off
 
     pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending", "points_part0", "points_part1" };
 
@@ -385,6 +387,8 @@ pub const TierCounts = struct {
         .dropped_temporaries = "Incomplete records removed at start.",
         .points_part0 = "Published points whose home is KV part 0 (an owner-sharded disk tier; 0 when replicated).",
         .points_part1 = "Published points whose home is KV part 1 (an owner-sharded disk tier; 0 when replicated).",
+        .pictures_kept = "Points written to disk with pictures before their cut.",
+        .pictures_refused = "Disk keeps and lookups with pictures turned away (ids and media disagree, or image cache off).",
     };
 };
 

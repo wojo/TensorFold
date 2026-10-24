@@ -498,10 +498,22 @@ pub const Features = struct {
     drafts: bool,
     streams: u32,
     prefill_rows: u32,
+    /// TF_GLM_IMAGE_CACHE (Settings.image_cache): written only when off ("image_cache=0;"), so the default's string,
+    /// and the namespace it feeds, are the same as before pictures were kept
+    image_cache: bool = true,
 };
 
 pub fn featureString(buf: []u8, f: Features) ![]const u8 {
-    return std.fmt.bufPrint(buf, "spill=2;spill_min={d};kv_shard={d};drafts={d};streams={d};prefill_rows={d};", .{ f.spill_min_tokens, @intFromBool(f.kv_shard), @intFromBool(f.drafts), f.streams, f.prefill_rows });
+    return std.fmt.bufPrint(buf, "spill=2;spill_min={d};kv_shard={d};drafts={d};streams={d};prefill_rows={d};{s}", .{ f.spill_min_tokens, @intFromBool(f.kv_shard), @intFromBool(f.drafts), f.streams, f.prefill_rows, if (f.image_cache) "" else "image_cache=0;" });
+}
+
+test "featureString: the image cache's switch is named only when off" {
+    var a: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    const on = try featureString(&a, .{ .spill_min_tokens = 8192, .drafts = true, .streams = 8, .prefill_rows = 2048 });
+    try testing.expectEqualStrings("spill=2;spill_min=8192;kv_shard=0;drafts=1;streams=8;prefill_rows=2048;", on);
+    const off = try featureString(&b, .{ .spill_min_tokens = 8192, .drafts = true, .streams = 8, .prefill_rows = 2048, .image_cache = false });
+    try testing.expectEqualStrings("spill=2;spill_min=8192;kv_shard=0;drafts=1;streams=8;prefill_rows=2048;image_cache=0;", off);
 }
 
 /// Every rank's share of the model (cuda_geometry), as text: the TP split every rank computes alike.
