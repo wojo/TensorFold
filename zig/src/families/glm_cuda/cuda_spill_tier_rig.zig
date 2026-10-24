@@ -35,7 +35,7 @@ pub const HostEngine = struct {
     pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null };
     pub const Buf = struct { ptr: u64, bytes: []u8 };
     pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?Buf = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
     pub const Window = struct { seq: *Seq, tokens: []const u32 };
     pub const DraftReq = struct { seq: *Seq };

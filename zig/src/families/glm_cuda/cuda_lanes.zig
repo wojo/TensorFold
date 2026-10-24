@@ -644,6 +644,10 @@ pub fn Lanes(comptime E: type) type {
             s.cached = @intCast(at);
             s.reuse_failed = s.reuse.at > 0 and from == null;
             self.dropTentative();
+            // pictures and clips: attached once for the whole pass at its resume point (the tower runs only for the
+            // items a row past it needs), so every mark's segment injects them too; detached when the pass ends
+            defer if (s.media != null) if (comptime @hasDecl(E, "detachMedia")) e.detachMedia();
+            if (s.media) |m| if (comptime @hasDecl(E, "attachPass")) try e.attachPass(m, ids.len, at);
             // TF_GLM_KV_SHARD_TWINS: a fresh prompt fills with rows of the other part borrowed, given back once it is in
             // (a failure on the way ends the pair, and the lane's release gives them back)
             const lent = if (from == null) try self.borrow(l) else false;
@@ -657,7 +661,7 @@ pub fn Lanes(comptime E: type) type {
                     std.log.warn("prompt cache: no state kept at {d} tokens (a rank is at its keep floor)", .{m});
                     continue;
                 }
-                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = if (live == null) cur else null, .live_from = live });
+                const r = try e.prefillWith(ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = if (live == null) cur else null, .live_from = live, .media = s.media, .hold_media = true });
                 // the save's outcome, agreed too: a rank the engine refused after all holds no state, so none keeps it,
                 // and every rank goes on the same way, from the rows it just ran (no restore, no rows again)
                 if (!(try self.agreeOn(r.kept != null))) {
@@ -686,7 +690,7 @@ pub fn Lanes(comptime E: type) type {
             var bits: ?[]u32 = null;
             defer if (bits) |m| self.gpa.free(m);
             const mask: []const u32 = if (comptime masked) try self.firstMask(s, &bits) else &.{};
-            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = if (live == null) cur else null, .live_from = live, .mask = mask, .media = s.media });
+            const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = if (live == null) cur else null, .live_from = live, .mask = mask, .media = s.media, .hold_media = true });
             if (lent) self.giveBack(l);
             self.endPass();
             return r.first;
@@ -1675,11 +1679,14 @@ const MiniEngine = struct {
     pub const snap_holds_rows = true;
     pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null, lent: bool = false };
     pub const Snap = struct { id: u64, pos: usize, mtp_len: usize = 0, tokens: []u32, home: ?usize = null };
-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
     pub const Window = struct { seq: *Seq, tokens: []const u32 };
     pub const DraftReq = struct { seq: *Seq };
     const Disk = struct { key: u64, at: u32, tokens: []u32 };
+    /// A prefillWith call as the pictures saw it: its rows, whether media were attached and from which item the
+    /// tower ran (`attachPass`'s cut, Media.neededFrom).
+    pub const MediaCall = struct { begin: usize, end: usize, attached: bool, from_item: usize };
 
     gpa: std.mem.Allocator,
     bound: ?*Seq = null,
@@ -1706,6 +1713,29 @@ const MiniEngine = struct {
     fills_live: usize = 0,
     lent_chunks: usize = 0, // fill steps whose sequence held borrowed rows
     media_passes: usize = 0, // prefillWith calls with pictures or clips
+    // pictures (the engine's attachPass / reserveMedia / detachMedia, as it orders them)
+    vision: bool = true, // the engine has a tower (false: reserveMedia refuses with NoVisionTower, as rank 0 without one)
+    media_reserved: bool = false,
+    media_attached: ?usize = null, // the first item the tower ran for, while attached
+    media_attaches: usize = 0,
+    media_calls: std.ArrayList(MediaCall) = .empty,
+
+    pub fn reserveMedia(e: *MiniEngine, m: *const lanes.Media, prompt_len: usize) !void {
+        e.detachMedia();
+        if (!e.vision) return error.NoVisionTower;
+        try m.check(prompt_len);
+        e.media_reserved = true;
+    }
+    pub fn attachPass(e: *MiniEngine, m: *const lanes.Media, prompt_len: usize, cut: usize) !void {
+        if (e.media_attached != null) return;
+        if (!e.media_reserved) try e.reserveMedia(m, prompt_len);
+        e.media_attached = m.neededFrom(cut).item;
+        e.media_attaches += 1;
+    }
+    pub fn detachMedia(e: *MiniEngine) void {
+        e.media_reserved = false;
+        e.media_attached = null;
+    }
 
     fn hash(tokens: []const u32) u32 {
         return @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(tokens)));
@@ -1800,6 +1830,11 @@ const MiniEngine = struct {
             e.resumed += 1;
         } else q.tokens.clearRetainingCapacity(); // the engine's cold reset of a used sequence
         try e.trace.append(e.gpa, .{ q.tokens.items.len, prompt.len });
+        if (o.media) |m| {
+            if (e.media_attached == null) try e.attachPass(m, prompt.len, q.tokens.items.len);
+            try e.media_calls.append(e.gpa, .{ .begin = q.tokens.items.len, .end = prompt.len, .attached = true, .from_item = e.media_attached.? });
+        } else if (e.media_attached != null) try e.media_calls.append(e.gpa, .{ .begin = q.tokens.items.len, .end = prompt.len, .attached = true, .from_item = e.media_attached.? });
+        defer if (!o.hold_media) e.detachMedia();
         if (q.lent) {
             if (!e.pool.?.holding(q.eid.?)) return error.TwinNotHeld;
             e.lent_fills += 1;
@@ -1925,6 +1960,7 @@ const MiniEngine = struct {
         e.disk.deinit(e.gpa);
         e.trace.deinit(e.gpa);
         e.chunk_log.deinit(e.gpa);
+        e.media_calls.deinit(e.gpa);
         if (e.pool) |*p| p.deinit();
     }
 };
@@ -2066,6 +2102,58 @@ test "kept states that hold their rows: a pass keeps at its marks, a later pass 
     try std.testing.expectEqual(@as(usize, 0), e1.snaps);
     try std.testing.expectEqual(@as(usize, 0), e0.seqs);
     try std.testing.expectEqual(@as(usize, 0), e1.seqs);
+}
+
+test "pictures in a pass: attached once at its resume point, every mark's segment injects them, detached when it ends; a resumed pass runs the tower only from the first picture past the cut" {
+    const gpa = std.testing.allocator;
+    const B = Lanes(MiniEngine);
+    var e0: MiniEngine = .{ .gpa = gpa };
+    defer e0.deinit();
+    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+    const hooks = r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var prompt: [200]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i * 7 % 101);
+    const px: [3 * 28 * 84]u8 = @splat(4);
+    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px } };
+    const rows = [_]u32{ 10, 11, 12, 100, 101, 102, 170, 171, 172 };
+    for (rows) |r| prompt[r] = 99;
+    const media: lanes.Media = .{ .rows = &rows, .items = &items };
+    // 1. a cold pass with marks at 64 and 128: one attach, every segment (the marks' and the last) with the pictures
+    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    try B.prefillFn(&r0, &s1);
+    try std.testing.expectEqual(@as(usize, 1), e0.media_attaches);
+    try std.testing.expectEqual(@as(usize, 3), e0.media_calls.items.len);
+    for (e0.media_calls.items, [_][2]usize{ .{ 0, 64 }, .{ 64, 128 }, .{ 128, 200 } }) |c, want| {
+        try std.testing.expect(c.attached and c.from_item == 0); // a fresh pass: the tower runs every picture
+        try std.testing.expectEqual(want, [2]usize{ c.begin, c.end });
+    }
+    try std.testing.expect(e0.media_attached == null and !e0.media_reserved); // detached at the pass's end
+    const k128 = adopter.saved[1];
+    B.releaseFn(&r0, &s1);
+    // 2. a resume at 128: the first two pictures are wholly in the kept state, so the tower runs from the third
+    e0.media_calls.clearRetainingCapacity();
+    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .saved = k128, .at = 128 } });
+    defer s2.deinit(gpa);
+    try B.prefillFn(&r0, &s2);
+    try std.testing.expectEqual(@as(u32, 128), s2.cached);
+    try std.testing.expectEqual(@as(usize, 1), e0.media_calls.items.len);
+    try std.testing.expectEqual(@as(usize, 2), e0.media_calls.items[0].from_item);
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), (try firstToken(B, &r0, &s2)));
+    try std.testing.expect(e0.media_attached == null);
+    B.releaseFn(&r0, &s2);
+    // 3. a picture prompt refused before its sequence (no tower on rank 0) leaves no sequence and nothing attached
+    e0.vision = false;
+    const seqs = e0.seqs;
+    var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = &prompt, .max_new = 4, .media = &media });
+    defer s3.deinit(gpa);
+    try std.testing.expectError(error.NoVisionTower, B.prefillFn(&r0, &s3));
+    try std.testing.expectEqual(seqs, e0.seqs);
+    try std.testing.expect(!e0.media_reserved);
+    r0.deinit();
+    try std.testing.expectEqual(@as(usize, 0), e0.snaps);
+    try std.testing.expectEqual(@as(usize, 0), e0.seqs);
 }
 
 test "TF_GLM_KV_SHARD: rank 0's placements reach rank 1 with the calls; one of its own elsewhere ends the pair, and with the check any other layout does" {
@@ -2910,7 +2998,10 @@ test "TF_GLM_FILL: a prompt with pictures runs whole at its begin (its rows come
     const pic = testPrompt(23);
     var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
     defer sa.deinit(gpa);
-    const media: lanes.Media = .{ .rows = &.{ 3, 4, 5 } };
+    // one picture of three rows, its canvas as the tower takes it (the engine checks the media before the pass)
+    const px: [3 * 28 * 84]u8 = @splat(4);
+    const items = [_]lanes.MediaItem{.{ .h = 28, .w = 84, .data = &px }};
+    const media: lanes.Media = .{ .rows = &.{ 3, 4, 5 }, .items = &items };
     var sm = try lanes.Stream.init(gpa, .{ .id = "m", .prompt = &pic, .max_new = 4, .media = &media });
     defer sm.deinit(gpa);
     try p.begin(&sa, &sa);
@@ -2931,6 +3022,68 @@ test "TF_GLM_FILL: a prompt with pictures runs whole at its begin (its rows come
         SlicedPair.B.releaseFn(&p.r0, s);
         SlicedPair.B.releaseFn(&p.r1, s);
     }
+}
+
+test "TF_GLM_FILL with pictures and marks: the whole pass at the begin attaches them once, every mark's segment injects them, both ranks keep the marks; a resume runs the tower from the first picture past its cut" {
+    const gpa = std.testing.allocator;
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
+    var prompt: [200]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i * 7 % 101);
+    const px: [3 * 28 * 84]u8 = @splat(4);
+    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px } };
+    const rows = [_]u32{ 10, 11, 12, 100, 101, 102, 170, 171, 172 };
+    for (rows) |r| prompt[r] = 99;
+    const media: lanes.Media = .{ .rows = &rows, .items = &items };
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    try p.begin(&s1, &s1);
+    for ([_]*MiniEngine{ &p.e0, &p.e1 }) |e| {
+        try std.testing.expectEqual(@as(usize, 1), e.media_attaches);
+        try std.testing.expectEqual(@as(usize, 3), e.media_calls.items.len);
+        for (e.media_calls.items, [_][2]usize{ .{ 0, 64 }, .{ 64, 128 }, .{ 128, 200 } }) |c, want| {
+            try std.testing.expect(c.attached and c.from_item == 0);
+            try std.testing.expectEqual(want, [2]usize{ c.begin, c.end });
+        }
+        try std.testing.expect(e.media_attached == null and !e.media_reserved); // detached at the pass's end
+        try std.testing.expectEqual(@as(usize, 0), e.fills_live + e.chunk_log.items.len); // no fill, no chunk
+    }
+    var st: [1]be.FillState = undefined;
+    try p.step(&.{&s1}, &.{&s1}, &st);
+    try std.testing.expectEqual(be.FillState.done, st[0]);
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s1));
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r1, &s1));
+    const k0 = try keptAts(gpa, &p.r0);
+    defer gpa.free(k0);
+    const k1 = try keptAts(gpa, &p.r1);
+    defer gpa.free(k1);
+    try std.testing.expectEqualSlices(u32, &.{128}, k0); // (the store dropped 64 at the second mark)
+    try std.testing.expectEqualSlices(u32, k0, k1);
+    const k128 = adopter.saved[1];
+    SlicedPair.B.releaseFn(&p.r0, &s1);
+    SlicedPair.B.releaseFn(&p.r1, &s1);
+    // a resume at 128: whole at its begin too, the tower from the third picture (the first two are in the state)
+    for ([_]*MiniEngine{ &p.e0, &p.e1 }) |e| e.media_calls.clearRetainingCapacity();
+    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .saved = k128, .at = 128 } });
+    defer s2.deinit(gpa);
+    var s2b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .media = &media, .reuse = .{ .saved = p.r1.savedFor(p.r0.keptOf(k128).?.key), .at = 128 } });
+    defer s2b.deinit(gpa);
+    try p.begin(&s2, &s2b);
+    try std.testing.expectEqual(@as(u32, 128), s2.cached);
+    try std.testing.expectEqual(@as(u32, 128), s2b.cached);
+    for ([_]*MiniEngine{ &p.e0, &p.e1 }) |e| {
+        try std.testing.expectEqual(@as(usize, 1), e.media_calls.items.len);
+        try std.testing.expectEqual(@as(usize, 2), e.media_calls.items[0].from_item);
+        try std.testing.expect(e.media_attached == null);
+    }
+    try p.step(&.{&s2}, &.{&s2b}, &st);
+    try std.testing.expectEqual(be.FillState.done, st[0]);
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s2));
+    SlicedPair.B.releaseFn(&p.r0, &s2);
+    SlicedPair.B.releaseFn(&p.r1, &s2b);
 }
 
 test "TF_GLM_KV_SHARD with TF_GLM_FILL: a fill borrows no rows (its history is fetched), so nothing is lent between its steps; the placements still check" {

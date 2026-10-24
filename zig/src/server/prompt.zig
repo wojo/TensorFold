@@ -11,11 +11,14 @@ const api = @import("engine_api");
 const vision = @import("vision");
 const helper_mod = @import("vision_helper.zig");
 const vision_server = @import("vision_server.zig");
+const Vision = vision_server.Vision;
 const log = @import("log.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null };
+/// `key` and `cache_media`: with `media`, the prompt cache's ids for the prompt and each item's identity
+/// (prompt_cache.prompt_media.keyOf); empty when the media are not keyed (the prompt is then neither kept nor resumed).
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null, key: []const u32 = &.{}, cache_media: []const api.prompt_cache.Media = &.{} };
 
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
@@ -128,7 +131,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
 
 /// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, marked, the
 /// media in order), normalized with their parts, rendered, then the vision backend: the token ids and the media the
-/// engine takes. Such a prompt is neither kept nor resumed.
+/// engine takes, keyed by their content for the prompt cache when the engine's tower encodes them (`keyMedia`).
 fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
     const v = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
     if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
@@ -195,9 +198,26 @@ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinkin
             m.check(ids.len) catch return cx.fail(.server, "the picture rows do not fit the prompt", .{});
             const t1 = std.Io.Clock.awake.now(srv.io).toNanoseconds();
             log.line("vision: {d} image(s), {d} clip(s): {d} visual tokens of {d} prompt tokens (frontend {d:.3}s)", .{ media.pictures.len, media.clips.len, fin.positions.len, ids.len, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
-            return .{ .ids = ids, .media = m };
+            return keyMedia(srv, cx, .{ .ids = ids, .media = m }, thinking);
         },
     }
+}
+
+/// A prompt with pictures keyed for the prompt cache: each item's canvas hashed (prompt_cache.prompt_media.keyOf), its
+/// positions' cache ids made from the digest, and the history (the prompt before the template's generation prompt)
+/// named so a later turn resumes it. TF_GLM_IMAGE_CACHE=0 (read with prompt_cache.imageCacheOn: exactly "0"), media
+/// that cannot be keyed (features, an item split across runs) or a cache-less engine: unkeyed, as before (nothing kept
+/// or resumed, no history).
+pub fn keyMedia(srv: *Server, cx: *Cx, r: Rendered, thinking: bool) errors.Refused!Rendered {
+    const m = r.media orelse return r;
+    if (!srv.info.prompt_cache or !api.prompt_cache.imageCacheOn(Vision.getenv("TF_GLM_IMAGE_CACHE"))) return r;
+    const k = (try api.prompt_cache.prompt_media.keyOf(cx.a, r.ids, m)) orelse return r;
+    var out = r;
+    out.key = k.keyed;
+    out.cache_media = k.media;
+    var probe: Cx = .{ .a = cx.a }; // a template that refuses the probe leaves the prompt without a history
+    out.history_len = api.prompt_cache.prompt_media.historyLen(r.ids, generationPrompt(srv, &probe, thinking) catch &.{}, k.media);
+    return out;
 }
 
 fn mediaFailure(cx: *Cx, e: anyerror, diag: *vision.errors.Diag) errors.Refused {

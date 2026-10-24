@@ -1156,7 +1156,7 @@ pub const Toy = struct {
     // -- kept prompt states (cuda_engine's Snapshot, prefillWith, copyPrefix, freeSnapshot) --
 
     pub const Snapshot = struct { pos: usize, mtp_len: usize, tokens: []u32 };
-    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+    pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snapshot = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
     pub const Prefilled = struct { first: u32, kept: ?*Snapshot = null };
 
     /// The prompt from 0, or from a kept state of this sequence (its first pos rows the prompt's), keeping the

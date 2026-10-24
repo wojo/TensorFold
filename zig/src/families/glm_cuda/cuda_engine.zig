@@ -85,10 +85,11 @@ pub const Seq = struct { slot: usize, st: state.State, alive: bool = false, tag:
 pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?cuda.DeviceBuffer = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
 const SpillJob = struct { snap: *Snap, tokens: []u32, at: u32, key: u64 };
 /// `mask`: structured output's bits for the first token (one row, the grammar's words); empty: unconstrained.
-/// `media`: picture and clip rows for this prompt.
+/// `media`: picture and clip rows for this prompt (attached at the call's resume point unless a pass attached them
+/// already: attachPass). `hold_media`: the rows stay attached after the call (a pass's mark segments; the pass detaches).
 /// `live_from`: the bound sequence stands at this position with live rows and no snapshot (a refused save, cuda_lanes
 /// pass): the prefill goes on from there, restoring nothing. `resume_from` and `live_from` exclude each other.
-pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
+pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null, hold_media: bool = false };
 pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
 
 /// A prompt's feature rows while it prefills: the prompt rows they replace (host copy, ascending) and the device
@@ -97,6 +98,8 @@ const Attached = struct {
     host_rows: []u32,
     rows: cuda.DeviceBuffer,
     feats: cuda.DeviceBuffer,
+    /// the rows and features are in place (attachMedia ran), not only reserved
+    attached: bool = false,
 };
 
 pub const media_width: usize = 4096;
@@ -191,6 +194,8 @@ pub const Engine = struct {
     /// the prompt in prefill when it has pictures or clips: the tower's rows, on the device (every rank)
     media: ?Attached = null,
     vision: bool = false,
+    /// pictures and clips whose tower run a resumed pass skipped (every row of theirs was in the restored state)
+    media_skipped: u64 = 0,
     /// rank 0 with --vision-backend zig: the vision tower (null: the server brings the features)
     tower: ?vision_tower.Tower = null,
     /// TF_GLM_KV_SHARD: this rank's view of the pool's two parts (null: off), the switches and the counters
@@ -789,10 +794,7 @@ pub const Engine = struct {
         const s = e.bound orelse return error.NoBoundSequence;
         if (prompt.len == 0 or prompt.len > e.context) return error.ContextFull;
         if (o.keep_at) |k| if (k == 0 or k > prompt.len or k % 64 != 0) return error.BadKeepPoint;
-        if (o.media) |m| {
-            try e.attachMedia(m, prompt.len);
-        }
-        defer e.detachMedia();
+        defer if (!o.hold_media) e.detachMedia();
         var fl: Fill = undefined;
         try e.startPass(&fl, s, prompt, sampling, o);
         defer e.gpa.free(fl.ids);
@@ -881,6 +883,8 @@ pub const Engine = struct {
             st.pos = 0;
             s.tag = 0;
         }
+        // the pictures' rows from here: the tower encodes only those a row past the resume point needs
+        if (o.media) |m| if (!e.mediaAttached()) try e.attachMedia(m, prompt.len, begin);
         if (e.mtpHead()) |m| {
             // from 0 the head starts empty; from a kept or live state it stands one row behind it (cuda_mtp_keep)
             try mtp_keep.enter(m, s.slot, begin);
@@ -1194,11 +1198,23 @@ pub const Engine = struct {
         e.media = .{ .host_rows = host, .rows = rows, .feats = feats };
     }
 
+    /// A prompt pass's pictures attached once for all its segments (cuda_lanes pass: its marks' prefills and the last
+    /// one inject from the same rows, and the pass detaches them at its end): `cut`, where the pass resumes.
+    pub fn attachPass(e: *Engine, m: *const lanes.Media, prompt_len: usize, cut: usize) !void {
+        if (!e.mediaAttached()) try e.attachMedia(m, prompt_len, cut);
+    }
+
+    pub fn mediaAttached(e: *const Engine) bool {
+        return if (e.media) |a| a.attached else false;
+    }
+
     /// The prompt's picture rows on every rank: rank 0 has them (host features, or the tower's output) and
-    /// broadcasts their prompt rows and values; rank 1 receives. Both ranks call it at the same point.
-    fn attachMedia(e: *Engine, m: *const lanes.Media, prompt_len: usize) !void {
+    /// broadcasts their prompt rows and values; rank 1 receives. Both ranks call it at the same point. A pass resuming
+    /// at `cut` runs the tower only on the items with a row at or past it (Media.neededFrom: the others' rows are in
+    /// the restored state, and no chunk reads their features); their features land at their own rows' offsets.
+    fn attachMedia(e: *Engine, m: *const lanes.Media, prompt_len: usize, cut: usize) !void {
         if (e.media == null) try e.reserveMedia(m, prompt_len);
-        const a = e.media.?;
+        const a = &e.media.?;
         const n = m.rowCount();
         if (n != a.host_rows.len) return error.BadMedia;
         if (e.g.rank == 0) {
@@ -1208,10 +1224,12 @@ pub const Engine = struct {
                 try a.feats.uploadAsync(0, m.features, e.stream.handle);
             } else {
                 const t = &(e.tower orelse return error.NoVisionTower);
-                const items = try e.gpa.alloc(vision_tower.Item, m.items.len);
+                const from = m.neededFrom(cut);
+                const items = try e.gpa.alloc(vision_tower.Item, m.items.len - from.item);
                 defer e.gpa.free(items);
-                for (m.items, items) |it, *slot| slot.* = .{ .frames = it.frames, .h = it.h, .w = it.w, .pixels = it.data };
-                try t.encode(items, a.feats.ptr);
+                for (m.items[from.item..], items) |it, *slot| slot.* = .{ .frames = it.frames, .h = it.h, .w = it.w, .pixels = it.data };
+                if (items.len > 0) try t.encode(items, a.feats.ptr + from.row * media_width * 2);
+                e.media_skipped += from.item;
             }
         }
         if (e.g.world > 1) {
@@ -1221,6 +1239,7 @@ pub const Engine = struct {
         }
         try e.stream.synchronize();
         if (e.g.rank != 0) try a.rows.download(0, std.mem.sliceAsBytes(a.host_rows));
+        a.attached = true;
         e.pe.inject = .{ .ctx = e, .call = injectMedia };
     }
 
