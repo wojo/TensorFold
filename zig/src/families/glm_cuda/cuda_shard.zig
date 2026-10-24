@@ -34,7 +34,7 @@ pub const gpu_paths = true;
 /// resume, which would otherwise recompute (on unless "0"; cuda_shard_keep.zig); TF_GLM_KV_SHARD_TWINS, a filling prompt
 /// borrowing free rows of the other part (on unless "0"; prompts only, no decode twins); TF_GLM_KV_SHARD_CHECK, decode rounds between the ranks' layout digests
 /// (DS TF_DS_KV_SHARD_CHECK: `check_rounds` unless set; a digest also rides each placement; 0: none, each placement
-/// still checked). TF_GLM_MULTI_LONE ("1") is read only to be refused. Off: the knobs are not read, and nothing
+/// still checked). TF_GLM_MULTI_LONE ("1") is read only for `warning`. Off: the knobs are not read, and nothing
 /// changes. TF_GLM_SPILL_V2 is not read here: spill v2's admission refuses it with sharding, and only with its tier on
 /// (--spill-gib and --snapshot-dir), where it would store a kept state that does not name its part.
 pub const Switches = struct {
@@ -102,13 +102,19 @@ fn env(name: [:0]const u8) ?[]const u8 {
 
 /// The settings sharding cannot serve, refused at start (Python engine.py's ValueError), alike on every rank (each
 /// input is in the agreed settings text): two ranks only (a part a rank), more than one stream (a stream lives in one
-/// part), no MTP head (its caches are its own, not the pool's), no TF_GLM_MULTI_LONE.
+/// part), no MTP head (its caches are its own, not the pool's). TF_GLM_MULTI_LONE=1 is a `warning`.
 pub fn refuse(s: Switches, world: u32, parallel: u32, mtp: bool) !void {
     if (!s.on) return;
     if (world != 2) return error.KvShardNeedsTwoRanks;
     if (parallel < 2) return error.KvShardNeedsParallel;
     if (mtp) return error.KvShardWithMtp;
-    if (s.lone) return error.KvShardWithLone;
+}
+
+/// The start-up's warning for a setting sharding runs beside but does not use (null: none): TF_GLM_MULTI_LONE=1, the
+/// Python fork's lone-stream decode, which the Python fork refuses with sharding and this engine does not have.
+pub fn warning(s: Switches) ?[]const u8 {
+    if (s.on and s.lone) return "TF_GLM_MULTI_LONE=1 does nothing on the Zig engine (it has no lone-stream decode); TF_GLM_KV_SHARD=1 runs as without it";
+    return null;
 }
 
 /// glm_shard.cu's image in a build that embeds kernels (`images`; a host-only build embeds none and launches nothing).
@@ -128,7 +134,6 @@ pub fn why(err: anyerror) ?[]const u8 {
         error.KvShardNeedsTwoRanks => "TF_GLM_KV_SHARD=1 needs two ranks (--tp 2)",
         error.KvShardNeedsParallel => "TF_GLM_KV_SHARD=1 needs --parallel above 1",
         error.KvShardWithMtp => "TF_GLM_KV_SHARD=1 does not run with the MTP drafter (DRAFTER=mtp)",
-        error.KvShardWithLone => "TF_GLM_KV_SHARD=1 does not run with TF_GLM_MULTI_LONE=1",
         error.KvShardNotBuilt => "TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet",
         error.NoKvShardKernels => "TF_GLM_KV_SHARD=1: this build has no glm_shard kernels (its fatbins came without glm_shard.fatbin)",
         else => null,

@@ -201,6 +201,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 fn kvAdmit(read: anyerror!shard.Switches, o: Options, choice: choice_mod.Choice) !shard.Switches {
     const sw = try read;
     try shard.refuse(sw, o.tp, o.parallel, o.drafts and choice == .mtp);
+    if (shard.warning(sw)) |w| std.log.warn("{s}", .{w});
     if (sw.on and !shard.gpu_paths) return error.KvShardNotBuilt;
     if (sw.on) try shard.kernelsIn(cuda.kernels.available, cuda.kernels.glm_shard);
     return sw;
@@ -768,7 +769,7 @@ test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that ca
     try std.testing.expectError(error.KvShardNeedsTwoRanks, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = false, .parallel = 4 }, .dflash2));
     try std.testing.expectError(error.KvShardNeedsParallel, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = false, .tp = 2 }, .dflash2));
     try std.testing.expectError(error.KvShardWithMtp, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = true, .tp = 2, .parallel = 2 }, .mtp));
-    try std.testing.expectError(error.KvShardWithLone, kvAdmit(shard.Switches{ .on = true, .lone = true }, o, .dflash2));
+    try std.testing.expectEqual(shard.Switches{ .on = true, .lone = true }, try kvAdmit(shard.Switches{ .on = true, .lone = true }, o, .dflash2)); // a warning
     try std.testing.expectEqual(shard.Switches{ .on = true }, try kvAdmit(shard.Switches{ .on = true }, o, .dflash2));
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: this build has no glm_shard kernels (its fatbins came without glm_shard.fatbin)", refusal(error.NoKvShardKernels).?);

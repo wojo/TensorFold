@@ -13,8 +13,12 @@ pub fn pow2(n: usize) usize {
 pub const Recorder = struct {
     launches: [64]Saved = undefined,
     n: usize = 0,
+    /// Each launch handed on instead of saved (a whole chunk is thousands; the AOT coverage test keeps lookups only).
+    sink: ?Sink = null,
+    pub const Sink = struct { ctx: *anyopaque, call: *const fn (*anyopaque, []const u8, []const aot.Arg, []const aot.Const) anyerror!void };
     pub const Saved = struct { name: []const u8, grid: [3]u32, args: [64]aot.Arg = undefined, nargs: usize, consts: [48]aot.Const = undefined, nconsts: usize };
     fn add(r: *Recorder, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+        if (r.sink) |s| return s.call(s.ctx, name, args, consts);
         if (r.n == r.launches.len or args.len > 64 or consts.len > 48) return error.TooManyLaunches;
         const s = &r.launches[r.n];
         s.* = .{ .name = name, .grid = grid, .nargs = args.len, .nconsts = consts.len };
