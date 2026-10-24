@@ -64,6 +64,7 @@ pub const Fake = struct {
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     ranked: bool = false, // the head gives its held chain back (alternatives)
     memory_lanes: ?usize = null, // prefill past this many live lanes fails with error.LaneMemory (no room yet)
+    refused_begins: usize = 0, // backendSliced: fills refused at their begin for memory_lanes
 
     const Fill = struct { s: *Stream, done: usize };
 
@@ -108,6 +109,11 @@ pub const Fake = struct {
 
     fn prefillBegin(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        // (lanes and fills both hold room: a fill past memory_lanes of them waits for one to free)
+        if (x.memory_lanes) |n| if (!x.lanes.contains(s) and x.lanes.count() + x.fills.items.len >= n) {
+            x.refused_begins += 1;
+            return error.LaneMemory;
+        };
         try x.fills.append(x.gpa, .{ .s = s, .done = 0 });
     }
 

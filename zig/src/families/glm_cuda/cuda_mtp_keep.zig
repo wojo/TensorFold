@@ -273,3 +273,75 @@ test "MTP digest: what the next pass reads, not rows past the head's length or a
         try std.testing.expect(d != try digest(r, m, len + 1, &scratch));
     }
 }
+
+const prefill_loop = @import("cuda_prefill_loop.zig");
+
+/// A head state kept at a mark: its cursor and its pending row.
+const Kept = struct { cursor: Cursor, pending: usize };
+
+/// A prompt pass as cuda_engine's Fill runs it (TF_GLM_FILL's fills and prefillWith alike: startPass, then passChunk
+/// until done): the head entered at `begin`, the plan's chunks (cuda_prefill_loop.Plan / Cursor) fed in order with the
+/// fill's prompt position starting at `begin` (Fill.prompt_at), the head checked after the keep point's run, as
+/// takeSnap checks it. Returns the head's state at the keep point, if the plan keeps.
+fn fillPass(h: *FakeHead, prompt: []const u32, begin: usize, keep_at: ?usize, limit: usize) !?Kept {
+    try enter(h, 0, begin);
+    const p = prefill_loop.Plan.of(prompt.len, begin, keep_at);
+    var cur: prefill_loop.Cursor = .{};
+    var at = begin;
+    var kept: ?Kept = null;
+    while (try cur.next(&p, limit)) |ch| {
+        // promptTaps after the target ran the chunk: e.prompt_at is the fill's, the chunk's own start
+        try std.testing.expectEqual(at, ch.pos);
+        try feed(h, {}, prompt, at, ch.rows, ch.pos, ch.pos + ch.rows - 1);
+        at += ch.rows;
+        if (!cur.ran(&p, ch)) continue;
+        if (p.keep and ch.run == 0) {
+            try keepable(h, 0, p.runs[0].end);
+            kept = .{ .cursor = h.cursor, .pending = h.pending.? };
+        }
+    }
+    try std.testing.expectEqual(prompt.len, at);
+    return kept;
+}
+
+test "MTP head through a Fill's plan (prefillWith = startPass + passChunk): cache off, every row once; a keep point, the lanes' mark segments and a resume absorb what one cold pass does" {
+    var buf: [5021]u32 = undefined;
+    const prompt = testPrompt(&buf, 17);
+    // cache off: one pass from 0, cut at the 64-grid point below the end (2048, 2048, 896, then 29 at 2048 a chunk)
+    for ([_]usize{ 128, 2048 }) |limit| for ([_]usize{ 1, 2, 63, 64, 65, 2047, 2049, 5021 }) |n| {
+        var h: FakeHead = .{};
+        defer h.deinit();
+        try std.testing.expect(try fillPass(&h, prompt[0..n], 0, null, limit) == null);
+        try expectWhole(&h, prompt[0..n]);
+    };
+    for ([_]usize{ 128, 2048 }) |limit| {
+        // one pass keeping at 2112 on its way: the state there is the head after the run to 2112
+        var a: FakeHead = .{};
+        defer a.deinit();
+        const k = (try fillPass(&a, prompt, 0, 2112, limit)).?;
+        try expectWhole(&a, prompt);
+        try std.testing.expectEqual(@as(usize, 2111), k.cursor.len);
+        try std.testing.expectEqual(@as(usize, 2111), k.pending);
+        // the lanes' pass with marks 64 and 2112: a segment per mark (prefillWith(ids[0..m], keep_at = m) from the
+        // last one, live rows standing), then the rest: the same rows as one cold pass
+        var b: FakeHead = .{};
+        defer b.deinit();
+        const k64 = (try fillPass(&b, prompt[0..64], 0, 64, limit)).?;
+        const k2112 = (try fillPass(&b, prompt[0..2112], 64, 2112, limit)).?;
+        try std.testing.expect(try fillPass(&b, prompt, 2112, null, limit) == null);
+        try std.testing.expectEqualSlices(Row, a.log.items, b.log.items);
+        try std.testing.expectEqual(k, k2112);
+        // resumed from each kept state on a head that ran another prompt since: what the cold pass did next
+        for ([_]Kept{ k64, k2112 }, [_]usize{ 64, 2112 }) |kk, m| {
+            var c: FakeHead = .{};
+            defer c.deinit();
+            _ = try fillPass(&c, prompt[100..300], 0, null, limit);
+            c.log.clearRetainingCapacity();
+            restored(&c, 0, m);
+            try std.testing.expectEqual(kk.cursor, c.cursor);
+            c.pending = kk.pending;
+            try std.testing.expect(try fillPass(&c, prompt, m, null, limit) == null);
+            try std.testing.expectEqualSlices(Row, a.log.items[m - 1 ..], c.log.items);
+        }
+    }
+}

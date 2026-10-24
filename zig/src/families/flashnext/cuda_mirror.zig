@@ -1158,9 +1158,17 @@ pub const Leader = struct {
     fn prefillBeginFn(p: *anyopaque, s: *Stream) anyerror!void {
         const self = of(p);
         try self.open.put(self.gpa, keyOf(s), {});
-        try self.send(.{ .prefill_begin = specOf(s) }, true);
-        self.arm(0);
+        var spec = specOf(s);
+        // structured output: the first token's bits ride with the fill's start, as with a whole prefill (the backend
+        // keeps its own copy for the draw at the fill's end)
+        if (s.grammar) |g| spec.mask = (try g.next(self.scratch())) orelse &.{};
+        try self.send(.{ .prefill_begin = spec }, true);
+        // a backend may run a prompt with pictures or clips whole at its start (GLM: its rows come by broadcast inside
+        // one prefill): a prefill's deadline then
+        self.arm(if (s.media != null) s.prompt_len / 400 else 0);
         defer self.disarm();
+        s.first_mask = spec.mask;
+        defer s.first_mask = &.{};
         return self.inner.vtable.prefill_begin.?(self.inner.ptr, s);
     }
 
@@ -2284,6 +2292,42 @@ test "prompts filling between rounds are mirrored: rank 1 fills the same slices 
     try std.testing.expectEqual(rank0.fill_steps, rank1.target.fill_steps);
     try std.testing.expectEqualSlices(u32, rank0.drawn.items, rank1.target.drawn.items);
     try std.testing.expectEqual(@as(u64, 0), rank1.failed);
+}
+
+test "a prompt filling between rounds carries its first token's bits to rank 1 with its start, as a whole prefill does" {
+    const gpa = std.testing.allocator;
+    var spy: Spy = .{ .gpa = gpa };
+    defer spy.deinit();
+    var rank0: fake.Fake = .{ .gpa = gpa };
+    defer rank0.deinit();
+    var leader = Leader.init(gpa, rank0.backendSliced(), spy.channel());
+    defer leader.deinit();
+    var seq: lanes.grammar.Sequence = .{ .want = &.{ 5, 40 }, .stop = 7, .gpa = gpa };
+    defer seq.log.deinit(gpa);
+    var k: lanes.grammar.Constraint = .init(seq.rules(), (fake.vocab + 31) / 32, null);
+    const prompt = [_]u32{ 3, 1, 4, 1, 5 };
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 4, .grammar = &k });
+    defer s.deinit(gpa);
+    const b = leader.backend();
+    try b.vtable.prefill_begin.?(b.ptr, &s);
+    try std.testing.expectEqual(@as(usize, 0), s.first_mask.len); // the Leader's for the call only
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var found = false;
+    for (spy.sent.items) |batch| {
+        var calls = try Calls.of(batch);
+        while (try calls.next()) |bytes| switch (try decode(arena.allocator(), bytes)) {
+            .prefill_begin => |spec| {
+                // the grammar allows token 5 alone first
+                try std.testing.expectEqual(@as(usize, (fake.vocab + 31) / 32), spec.mask.len);
+                for (0..fake.vocab) |t| try std.testing.expectEqual(t == 5, lanes.grammar.allows(spec.mask, t));
+                found = true;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(found);
+    b.vtable.release(b.ptr, &s);
 }
 
 test "structured output's bits ride with a prompt and with a window" {

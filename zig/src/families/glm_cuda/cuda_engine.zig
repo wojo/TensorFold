@@ -784,6 +784,7 @@ pub const Engine = struct {
     /// first token from the last row's logits. `resume_from`: a kept state (takeSnap) of a prefix of the prompt on the
     /// 64-token grid, put back first; the chunks then start there. `keep_at`: a grid point where the state is kept
     /// (the result's `kept`); at the prompt's end nothing is sampled (`first` is 0), the pass only fills the caches.
+    /// The pass is a Fill run to its end here (fillBegin / fillStep run the same chunks one a step, between rounds).
     pub fn prefillWith(e: *Engine, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
         const s = e.bound orelse return error.NoBoundSequence;
         if (prompt.len == 0 or prompt.len > e.context) return error.ContextFull;
@@ -792,16 +793,78 @@ pub const Engine = struct {
             try e.attachMedia(m, prompt.len);
         }
         defer e.detachMedia();
+        var fl: Fill = undefined;
+        try e.startPass(&fl, s, prompt, sampling, o);
+        defer e.gpa.free(fl.ids);
+        errdefer if (fl.kept) |k| e.freeSnapshot(k);
+        while (!try e.passChunk(&fl)) {}
+        return .{ .first = fl.first, .kept = fl.kept };
+    }
+
+    /// A prompt pass a chunk at a time (prefillWith's, cut where its loop cuts: 2048-row chunks, the 64-token grid point
+    /// below the end, the keep point): its plan (cuda_prefill_loop.Plan) and cursor, the prompt's ids, its first token's
+    /// bits, and its outcome (`kept` at the keep point, `first` once `done`). Every chunk binds the fill's own sequence
+    /// to the prompt path first, so decode rounds of other sequences (which bind theirs) run between its steps.
+    pub const Fill = struct {
+        seq: *Seq,
+        /// the caller's: the stream's prompt (or prefix) outlives the fill
+        prompt: []const u32,
+        ids: []i32,
+        sampling: ?lanes.Sampling,
+        /// structured output's bits for the first token (the caller's, as long as the fill)
+        mask: []const u32,
+        keep_at: ?usize,
+        plan: prefill_loop.Plan,
+        cursor: prefill_loop.Cursor = .{},
+        /// the drafters' prompt position (promptTaps' e.prompt_at) between steps
+        prompt_at: usize = 0,
+        kept: ?*Snap = null,
+        first: u32 = 0,
+        done: bool = false,
+    };
+
+    /// A prompt pass on `seq` that fills a chunk a fillStep (the lanes' sliced fills, TF_GLM_FILL=1): prefillWith's start
+    /// (the resume restored, a live position taken, or the recurrent state cleared) now; the chunks then run in fillStep.
+    /// A prompt with pictures or clips, or MTP drafts (one head for every stream), runs whole (prefillWith) instead.
+    pub fn fillBegin(e: *Engine, seq: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
+        // (a head loaded without MTP drafts, TF_GLM_MTP=1, absorbs nothing in a pass: promptTaps)
+        if (e.mtpHead() != null) return error.FillWithMtp;
+        if (o.media != null) return error.FillWithMedia;
+        if (prompt.len == 0 or prompt.len > e.context) return error.ContextFull;
+        if (o.keep_at) |k| if (k == 0 or k > prompt.len or k % 64 != 0) return error.BadKeepPoint;
+        const fl = try e.gpa.create(Fill);
+        errdefer e.gpa.destroy(fl);
+        e.bound = seq;
+        try e.startPass(fl, seq, prompt, sampling, o);
+        return fl;
+    }
+
+    /// Up to `chunks` more chunks of the fill (the lanes take one); true once its prompt is in and `first` holds its draw
+    /// (or, with a keep point at the prompt's end, its state is in `kept`).
+    pub fn fillStep(e: *Engine, fl: *Fill, chunks: usize) !bool {
+        for (0..@max(chunks, 1)) |_| if (try e.passChunk(fl)) return true;
+        return false;
+    }
+
+    pub fn fillFree(e: *Engine, fl: *Fill) void {
+        if (fl.kept) |k| e.freeSnapshot(k);
+        e.gpa.free(fl.ids);
+        e.gpa.destroy(fl);
+    }
+
+    /// A pass's start on `s` (prefillWith's, before its chunks): the prompt's ids, where it begins (a live position, a
+    /// kept state restored, or 0 with the recurrent state cleared), the drafters reset there, and its plan.
+    fn startPass(e: *Engine, fl: *Fill, s: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !void {
         const st = &s.st;
         const ids = try e.gpa.alloc(i32, prompt.len);
-        defer e.gpa.free(ids);
+        errdefer e.gpa.free(ids);
         for (prompt, ids) |t, *d| {
             if (t >= 154880) return error.BadToken;
             d.* = @intCast(t);
         }
         var begin: usize = 0;
         if (o.live_from) |p| {
-            // the sequence's own rows up to p (a refused save left it there): no restore
+            // the sequence's own rows up to p (a refused save left it there, or a sliced fill's last keep): no restore
             if (o.resume_from != null or p == 0 or p >= prompt.len or p % 64 != 0 or st.pos != p) return error.ResumeMustExtend;
             begin = p;
         } else if (o.resume_from) |snap| {
@@ -818,9 +881,6 @@ pub const Engine = struct {
             st.pos = 0;
             s.tag = 0;
         }
-        e.prompt_tokens = prompt;
-        e.prompt_at = begin;
-        defer e.prompt_tokens = &.{};
         if (e.mtpHead()) |m| {
             // from 0 the head starts empty; from a kept or live state it stands one row behind it (cuda_mtp_keep)
             try mtp_keep.enter(m, s.slot, begin);
@@ -830,40 +890,56 @@ pub const Engine = struct {
             try p.multi.reset(s.slot, prompt, .{});
             p.multi.contexts[s.slot].end = begin; // the window of rows [0, begin) is the restored (or live) one
         }
-        e.pe.cache = st.cache;
-        e.pe.conv = st.fixed.conv;
-        e.pe.rec = st.fixed.rec;
-        e.pe.pos_dev = st.fixed.pos_dev;
-        var kept: ?*Snap = null;
-        errdefer if (kept) |k| e.freeSnapshot(k);
-        if (o.keep_at) |k| if (k > begin) {
-            _ = try prefill_loop.run(&e.pe, &st.cur, .{ .tokens = ids[0..k], .begin = begin, .limit = e.prefill_rows, .head = false, .tap_ctx = e, .on_taps = promptTaps });
-            st.pos = k;
-            // the save may be refused (the keep floor, or no device memory): never the prompt, which goes on from its
-            // live rows (the lanes continue from them, `live_from`; the ranks agreed on this keep from their free
-            // memory first, cuda_lanes pass, so this is the rare case of memory going in between)
-            kept = e.takeSnap(s, k) catch |err| switch (err) {
-                error.BelowMemoryReserve, error.OutOfDeviceMemory => blk: {
-                    std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k, @errorName(err) });
-                    break :blk null;
-                },
-                else => return err,
-            };
-            begin = k;
-        };
-        if (begin == prompt.len) return .{ .first = 0, .kept = kept };
-        // The reference keeps the prompt's state on the 64-row grid (engine.grid_point) and resumes from it to the end, so
-        // the last chunk is cut there: prompt rows .. B, then B .. n (a 5021-token prompt: 2048, 2048, 896, then 29).
-        const point = if (prompt.len % 64 == 0) prompt.len else prompt.len / 64 * 64;
-        if (point > begin and point < prompt.len) _ = try prefill_loop.run(&e.pe, &st.cur, .{ .tokens = ids[0..point], .begin = begin, .limit = e.prefill_rows, .head = false, .tap_ctx = e, .on_taps = promptTaps });
-        _ = try prefill_loop.run(&e.pe, &st.cur, .{ .tokens = ids, .limit = e.prefill_rows, .begin = if (point < prompt.len and point > begin) point else begin, .head = true, .tap_ctx = e, .on_taps = promptTaps });
-        st.pos = prompt.len;
-        if (e.mtpHead()) |m| e.logMtpDigest(m, "prompt end", prompt.len);
+        fl.* = .{ .seq = s, .prompt = prompt, .ids = ids, .sampling = sampling, .mask = o.mask, .keep_at = o.keep_at, .plan = prefill_loop.Plan.of(prompt.len, begin, o.keep_at), .prompt_at = begin };
+    }
+
+    /// The fill's next chunk on its own sequence (bound to the prompt path first: rounds of other sequences ran since);
+    /// after the keep point's run its state is kept, after the head's the first token is drawn. True when it is done.
+    fn passChunk(e: *Engine, fl: *Fill) !bool {
+        if (fl.done) return true;
+        const s = fl.seq;
+        const st = &s.st;
+        if (try fl.cursor.next(&fl.plan, e.prefill_rows)) |ch| {
+            const r = fl.plan.runs[ch.run];
+            e.bound = s;
+            e.pe.cache = st.cache;
+            e.pe.conv = st.fixed.conv;
+            e.pe.rec = st.fixed.rec;
+            e.pe.pos_dev = st.fixed.pos_dev;
+            e.prompt_tokens = fl.prompt;
+            e.prompt_at = fl.prompt_at;
+            defer {
+                fl.prompt_at = e.prompt_at;
+                e.prompt_tokens = &.{};
+            }
+            _ = try prefill_loop.chunkAt(&e.pe, &st.cur, .{ .tokens = fl.ids[0..r.end], .begin = r.begin, .limit = e.prefill_rows, .head = r.head, .tap_ctx = e, .on_taps = promptTaps }, ch.pos, ch.rows);
+            if (!fl.cursor.ran(&fl.plan, ch)) return false;
+            if (fl.plan.keep and ch.run == 0) {
+                const k = r.end;
+                st.pos = k;
+                // the save may be refused (the keep floor, or no device memory): never the prompt, which goes on from its
+                // live rows (the lanes continue from them, `live_from`; the ranks agreed on this keep from their free
+                // memory first, cuda_lanes pass, so this is the rare case of memory going in between)
+                fl.kept = e.takeSnap(s, k) catch |err| switch (err) {
+                    error.BelowMemoryReserve, error.OutOfDeviceMemory => blk: {
+                        std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ k, @errorName(err) });
+                        break :blk null;
+                    },
+                    else => return err,
+                };
+            }
+            if (fl.cursor.run < fl.plan.n) return false;
+        }
+        fl.done = true;
+        if (!fl.plan.draws) return true;
+        st.pos = fl.prompt.len;
+        if (e.mtpHead()) |m| e.logMtpDigest(m, "prompt end", fl.prompt.len);
         var out: [1]u32 = undefined;
-        const rule: ?lanes.Sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null;
-        if (o.mask.len > 0) try e.maskRows(0, e.pe.b.logits, 1, o.mask);
-        try e.sampler.samplePacked(&.{.{ .logits = e.pe.b.logits, .positions = &.{@as(u64, prompt.len)}, .sampling = rule, .out = &out }});
-        return .{ .first = out[0], .kept = kept };
+        const rule: ?lanes.Sampling = if (fl.sampling) |x| (if (x.temperature > 0) x else null) else null;
+        if (fl.mask.len > 0) try e.maskRows(0, e.pe.b.logits, 1, fl.mask);
+        try e.sampler.samplePacked(&.{.{ .logits = e.pe.b.logits, .positions = &.{@as(u64, fl.prompt.len)}, .sampling = rule, .out = &out }});
+        fl.first = out[0];
+        return true;
     }
 
     // -- kept prompt states (cuda_snapshot.zig) -----------------------------------------------------------------------
@@ -1798,6 +1874,24 @@ test "MTP drafts: a prompt goes on from live rows (a refused save) only where th
     e.mtp.?.slot = 1;
     e.mtp.?.cursor = .{ .len = 127 };
     try std.testing.expectError(error.MtpNotAtResume, e.prefillWith(&prompt, null, .{ .live_from = 128 }));
+}
+
+test "TF_GLM_FILL with MTP drafts: a sliced fill is refused before it starts (FillWithMtp); a head loaded beside DFlash2 is not, and a picture prompt is refused for its pictures (FillWithMedia)" {
+    var e: Engine = undefined;
+    hostMtpEngine(&e, .mtp, 127);
+    var seq: Seq = .{ .slot = 0, .st = undefined, .alive = true };
+    seq.st.pos = 128;
+    var prompt: [200]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i);
+    const media: lanes.Media = .{ .rows = &.{ 3, 4, 5 } };
+    try std.testing.expectError(error.FillWithMtp, e.fillBegin(&seq, &prompt, null, .{}));
+    try std.testing.expectError(error.FillWithMtp, e.fillBegin(&seq, &prompt, null, .{ .media = &media }));
+    // nothing moved: the head stands where it stood
+    try std.testing.expectEqual(@as(usize, 127), e.mtp.?.cursor.len);
+    e.draft_choice = .dflash2;
+    e.bound = null;
+    try std.testing.expectError(error.FillWithMedia, e.fillBegin(&seq, &prompt, null, .{ .media = &media }));
+    try std.testing.expect(e.bound == null);
 }
 
 /// A host engine of TF_GLM_KV_SHARD's pool for rank `r` (no device: views are arithmetic over made-up planes).

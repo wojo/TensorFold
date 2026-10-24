@@ -143,14 +143,27 @@ test "the same when the backend runs the prompt pass a chunk a round" {
     try waitsForMemory(true);
 }
 
+test "the same when the backend fills prompts in slices between rounds (GLM's TF_GLM_FILL): the refused fill is requeued, then runs" {
+    try waitsForMemoryOn(.sliced);
+}
+
 fn waitsForMemory(stepped: bool) !void {
+    try waitsForMemoryOn(if (stepped) .stepped else .whole);
+}
+
+fn waitsForMemoryOn(mode: enum { whole, stepped, sliced }) !void {
+    const stepped = mode == .stepped;
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
     var target: lanes.fake.Fake = .{ .gpa = gpa, .memory_lanes = 1, .prefill_chunks = if (stepped) 3 else 0 };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, if (stepped) target.stepped() else target.backend(), clock.clock());
+    var core = lanes.Engine.init(gpa, &cfg, switch (mode) {
+        .whole => target.backend(),
+        .stepped => target.stepped(),
+        .sliced => target.backendSliced(),
+    }, clock.clock());
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
     try host.start();
@@ -189,6 +202,10 @@ fn waitsForMemory(stepped: bool) !void {
     try std.testing.expectEqual(Reason.length, first.wait());
     try std.testing.expectEqual(Reason.length, second.wait());
     try std.testing.expectEqual(@as(usize, 48), second.tokens);
+    if (mode == .sliced) {
+        try std.testing.expect(target.refused_begins > 0); // it waited at the queue's head, not dropped
+        try std.testing.expect(target.fill_steps > 0);
+    }
 }
 
 test "a lane host serves the core's own tokens, in order, and cancels between rounds" {

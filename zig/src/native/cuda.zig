@@ -804,6 +804,92 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
 }
 
+test "GLM with TF_GLM_FILL behind the lane host: a stream decodes between a long prompt's fill steps, and both replies are their serial ones" {
+    const gpa = std.testing.allocator;
+    const Toy = @import("flashnext").lane_backend.Toy;
+    var t: Toy = .{ .gpa = gpa };
+    var b = glm_cuda.backend.Lanes(Toy).init(gpa, &t, true, 4096, 8);
+    defer b.deinit();
+    b.streams = 2;
+    b.sliced = true;
+    for (b.costs[0..8], 1..) |*c, width| c.* = .{ .width = @intCast(width), .ms = 8 + 0.3 * @as(f64, @floatFromInt(width)) };
+    b.cost_count = 8;
+    b.mtp_ms = 0.4;
+    const Nothing = struct {
+        fn release(_: *anyopaque) void {}
+    };
+    const h = try gpa.create(Host);
+    defer gpa.destroy(h);
+    h.* = .{ .gpa = gpa, .gpu = null, .family = &b, .release = Nothing.release, .inner = b.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+    try h.serve(std.testing.io, b.facts(), 8, .{ .lanes = 2 }, null);
+    defer {
+        h.host.stop();
+        h.core.deinit();
+        h.cfg.deinit(gpa);
+    }
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: std.ArrayList(u32) = .empty,
+        done: ?api.Reason = null,
+        toy: *const Toy,
+        during_fill: usize = 0, // token batches delivered while another prompt's fill was open (lane thread)
+        fn event(ctx: *anyopaque, _: api.Id, ev: *const api.Event) void {
+            const x: *@This() = @ptrCast(@alignCast(ctx));
+            x.mutex.lockUncancelable(std.testing.io);
+            defer x.mutex.unlock(std.testing.io);
+            switch (ev.*) {
+                .tokens => |tk| {
+                    x.tokens.appendSlice(gpa, tk) catch {};
+                    if (x.toy.fills > 0) x.during_fill += 1;
+                },
+                .finished => |f| x.done = f.reason,
+                else => {},
+            }
+        }
+        fn count(x: *@This()) usize {
+            x.mutex.lockUncancelable(std.testing.io);
+            defer x.mutex.unlock(std.testing.io);
+            return x.tokens.items.len;
+        }
+        fn wait(x: *@This()) api.Reason {
+            while (true) {
+                x.mutex.lockUncancelable(std.testing.io);
+                const d = x.done;
+                x.mutex.unlock(std.testing.io);
+                if (d) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const short = [_]u32{ 1, 2, 3 };
+    var long: [600]u32 = undefined;
+    for (&long, 0..) |*x, i| x.* = @intCast(i % 41);
+    const e = h.host.engine();
+    var a: Box = .{ .toy = &t };
+    defer a.tokens.deinit(gpa);
+    var bb: Box = .{ .toy = &t };
+    defer bb.tokens.deinit(gpa);
+    const ra: api.Request = .{ .prompt = &short, .max_tokens = 200 };
+    try e.submit(1, &ra, .{ .ctx = &a, .event = Box.event });
+    while (a.count() == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    const rb: api.Request = .{ .prompt = &long, .max_tokens = 20 };
+    try e.submit(2, &rb, .{ .ctx = &bb, .event = Box.event });
+    try std.testing.expectEqual(api.Reason.length, bb.wait());
+    try std.testing.expectEqual(api.Reason.length, a.wait());
+    // the long prompt's fill took several steps, and the decoding stream's tokens came between them
+    try std.testing.expect(a.during_fill >= 2);
+    for ([_]struct { p: []const u32, n: usize, got: []const u32 }{ .{ .p = &short, .n = 200, .got = a.tokens.items }, .{ .p = &long, .n = 20, .got = bb.tokens.items } }) |c| {
+        var serial: Toy = .{ .gpa = gpa };
+        const seq = try serial.newSeq(4096);
+        defer serial.freeSeq(seq);
+        serial.bind(seq);
+        const first = try serial.prefill(c.p, null);
+        var result = try flashnext.decode.serial(Toy, &serial, gpa, first, .{ .count = c.n });
+        defer result.deinit(gpa);
+        try std.testing.expectEqualSlices(u32, result.tokens.items, c.got);
+    }
+}
+
 /// The prompt cache's mark hook in a two-rank GLM pass: the store keeps the state there (write at keep with a tier).
 const SpillKeeper = struct {
     store: *api.prompt_cache.Store,
