@@ -575,6 +575,38 @@ test "a prompt's chunks are the rows and positions the sweep enumerates" {
     try std.testing.expectEqual(grid.Span{ .start = 4992, .rows = 29 }, five[3]);
 }
 
+test "the engine's prompt pass cuts its chunks as promptChunks does: a Fill's plan (prefillWith and TF_GLM_FILL's fills), with and without a keep point" {
+    const loop = @import("cuda_prefill_loop.zig");
+    var prng = std.Random.DefaultPrng.init(0x65);
+    const rnd = prng.random();
+    for (0..2000) |_| {
+        const n = rnd.intRangeAtMost(usize, 1, 1 << 20);
+        const begin = rnd.uintLessThan(usize, (n - 1) / grid.state_grid + 1) * grid.state_grid;
+        // a keep point on the grid past the begin (a mark, or the lanes' keep at a segment's end), or none
+        const top = n / grid.state_grid * grid.state_grid;
+        const keep: ?usize = if (top > begin and rnd.boolean()) begin + (1 + rnd.uintLessThan(usize, (top - begin) / grid.state_grid)) * grid.state_grid else null;
+        const plan = loop.Plan.of(n, begin, keep);
+        var cur: loop.Cursor = .{};
+        // what the sweep enumerates: [begin, keep) cut at the chunk limit, then promptChunks from the keep (or begin)
+        var want: [1100]grid.Span = undefined;
+        var k: usize = 0;
+        var from = begin;
+        if (keep) |kp| {
+            k = (try grid.chunks(kp, begin, grid.chunk_rows, &want)).len;
+            from = kp;
+        }
+        if (from < n) k += (try promptChunks(n, from, false, want[k..])).len;
+        var i: usize = 0;
+        while (try cur.next(&plan, grid.chunk_rows)) |ch| : (i += 1) {
+            try std.testing.expect(i < k);
+            try std.testing.expectEqual(want[i], grid.Span{ .start = ch.pos, .rows = ch.rows });
+            try std.testing.expect(std.mem.indexOfScalar(usize, &chunk_rows, ch.rows) != null);
+            _ = cur.ran(&plan, ch);
+        }
+        try std.testing.expectEqual(k, i);
+    }
+}
+
 test "a variant the set lacks is reported where it is reached: decode selection over a pool past ~2.1M rows" {
     var set = try loadSet();
     defer set.deinit();

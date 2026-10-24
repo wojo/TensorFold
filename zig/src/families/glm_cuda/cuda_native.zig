@@ -103,6 +103,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // TF_GLM_SPILL_V2 and the recipe's identity with it: the same (each rank's own, refused after the agreement)
     const v2 = spillV2(o, choice);
     var spill_env: ?identity.Env = null;
+    // TF_GLM_FILL: in the settings text (every rank must fill alike: the mirror replays rank 0's slices), refused after
+    // the agreement on every rank alike
+    var sliced = false;
     const own = try gpa.create(Own);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
@@ -134,6 +137,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         };
         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
         spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
+        sliced = fillAdmit(fillSetting(), o, choice) catch |e| return kvRefused(e);
         own.comm = try comm.Comm.init(gpa, own.link.?, o.rank, o.tp);
         std.log.info("rank {d}: settings agreed, NCCL joined", .{o.rank});
         own.watch = .{ .io = io, .fd = own.link.?.fd, .more = own.link.?.more, .rank = o.rank, .comm = mirror.Coll.of(comm.Comm, &own.comm.?) };
@@ -141,6 +145,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     } else {
         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
         spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
+        sliced = fillAdmit(fillSetting(), o, choice) catch |e| return kvRefused(e);
     }
     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
@@ -173,7 +178,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         errdefer if (own.agreement) |*a| a.deinit();
         own.records = .{ .gpa = gpa, .wire = own.bcast.?.wire(), .link = mirrorLink(own.link.?), .watch = &own.watch.? };
     }
-    try own.serving.?.init(gpa, own.engine.?, context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null);
+    try own.serving.?.init(gpa, own.engine.?, context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null, sliced);
+    if (sliced) std.log.info("rank {d}: TF_GLM_FILL=1: prompts fill a 2048-row chunk a step between decode rounds", .{o.rank});
     if (own.agreement) |*a| own.serving.?.setAgreement(a.gate(), if (own.watch) |*w| w else null);
     const build_key = if (agreement == null) buildKey(gpa, io, dir, kernels, o) catch 0 else 0;
     var budget: u64 = 0;
@@ -207,6 +213,24 @@ fn kvAdmit(read: anyerror!shard.Switches, o: Options, choice: choice_mod.Choice)
     return sw;
 }
 
+/// TF_GLM_FILL: "1" fills prompts a chunk a step between decode rounds (cuda_lanes' sliced fills: the other streams
+/// decode between a long prompt's chunks); unset, blank or "0": whole passes on the lane thread (the default). Anything
+/// else is this rank's error (refused after the agreement, as the settings text says it).
+fn fillSetting() anyerror!bool {
+    const v = std.mem.trim(u8, envText("TF_GLM_FILL") orelse return false, " ");
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.BadFill;
+}
+
+/// TF_GLM_FILL once the ranks agreed on it: this rank's read error, or MTP drafts (one MTP head for every stream: a
+/// fill's chunks would absorb into it between other streams' drafts).
+fn fillAdmit(read: anyerror!bool, o: Options, choice: choice_mod.Choice) !bool {
+    const on = try read;
+    if (on and o.drafts and choice == .mtp) return error.FillWithMtp;
+    return on;
+}
+
 /// The refusal in the start-up's log, in words.
 fn kvRefused(err: anyerror) anyerror {
     std.log.err("{s}", .{refusal(err) orelse @errorName(err)});
@@ -217,6 +241,8 @@ fn kvRefused(err: anyerror) anyerror {
 pub fn refusal(err: anyerror) ?[]const u8 {
     return shard.why(err) orelse identity.why(err) orelse switch (err) {
         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
+        error.BadFill => "TF_GLM_FILL: 1 (prompts fill a chunk a step between decode rounds) or 0 (whole passes), nothing else",
+        error.FillWithMtp => "TF_GLM_FILL=1 does not run with MTP drafts (one MTP head serves every stream); DFlash2 drafts or none",
         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
         error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: spill v2 does not store the MTP head's state yet (MTP drafts keep prompt states in memory only; DFlash2 drafts or none)",
         error.SpillV2NoPromptCache => "TF_GLM_SPILL_V2=1 needs the prompt cache, and a rank's kept-state budget is 0 (--prompt-cache-gib; with PROMPT_CACHE_GIB a lower KV_POOL_GIB)",
@@ -648,8 +674,10 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
     // either says so (a word no rank sends when it can)
     var v2_buf: [192]u8 = undefined;
     const v2_words: []const u8 = if (v2) |env| (if (env != null) try spillWords(&v2_buf, o) else "") else |_| " spill_v2=unreadable";
-    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}", .{
-        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words,
+    // TF_GLM_FILL: on, or a rank that cannot read it (nothing when off: the text as before)
+    const fill_words: []const u8 = if (fillSetting()) |on| (if (on) " fill=1" else "") else |_| " fill=unreadable";
+    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}{s}", .{
+        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words, fill_words,
     });
 }
 
@@ -786,6 +814,49 @@ test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that ca
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: this build has no glm_shard kernels (its fatbins came without glm_shard.fatbin)", refusal(error.NoKvShardKernels).?);
     try std.testing.expect(refusal(error.OutOfMemory) == null);
 }
+
+test "TF_GLM_FILL: the settings text carries it only when on (after spill v2's words), a rank that cannot read it a word no rank sends; refused with MTP drafts; every refusal in words" {
+    const gpa = std.testing.allocator;
+    const o: Options = .{ .context = 8192, .drafts = false, .parallel = 4, .tp = 2 };
+    var drafted = o;
+    drafted.drafts = true;
+    defer _ = TestEnv.unsetenv("TF_GLM_FILL");
+    _ = TestEnv.unsetenv("TF_GLM_FILL");
+    const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+    defer gpa.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "fill") == null);
+    try std.testing.expectEqual(false, try fillSetting());
+    for ([_][:0]const u8{ "", "0", " 0 " }) |v| {
+        _ = TestEnv.setenv("TF_GLM_FILL", v, 1);
+        try std.testing.expectEqual(false, try fillSetting());
+        const same = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+        defer gpa.free(same);
+        try std.testing.expectEqualStrings(off, same); // off: the text as before
+    }
+    _ = TestEnv.setenv("TF_GLM_FILL", "1", 1);
+    try std.testing.expectEqual(true, try fillSetting());
+    const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true }, null);
+    defer gpa.free(on);
+    try std.testing.expect(std.mem.endsWith(u8, on, " lone=0 fill=1"));
+    _ = TestEnv.setenv("TF_GLM_FILL", "yes", 1);
+    try std.testing.expectError(error.BadFill, fillSetting());
+    const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.endsWith(u8, bad, " fill=unreadable"));
+    // after the agreement: this rank's own error; MTP drafts refused; DFlash2 drafts, no drafts, or off pass
+    try std.testing.expectError(error.BadFill, fillAdmit(error.BadFill, drafted, .dflash2));
+    try std.testing.expectError(error.FillWithMtp, fillAdmit(true, drafted, .mtp));
+    try std.testing.expectEqual(true, try fillAdmit(true, drafted, .dflash2));
+    try std.testing.expectEqual(true, try fillAdmit(true, o, .mtp));
+    try std.testing.expectEqual(false, try fillAdmit(false, drafted, .mtp));
+    try std.testing.expect(refusal(error.BadFill) != null);
+    try std.testing.expect(refusal(error.FillWithMtp) != null);
+}
+
+const TestEnv = struct {
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+};
 
 test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sharding's words, a rank that cannot read it or its identity a word no rank sends; two ranks only; every refusal in words" {
     const gpa = std.testing.allocator;

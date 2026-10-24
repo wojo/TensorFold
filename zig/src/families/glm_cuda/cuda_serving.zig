@@ -11,11 +11,14 @@ pub fn Serving(comptime E: type) type {
         local: backend.Lanes(E),
         leader: ?mirror.Leader = null,
         follower: ?mirror.Follower = null,
-        /// The object must remain at a stable address after init: mirrored backends point to local.
-        pub fn init(self: *Self, gpa: std.mem.Allocator, engine: *E, context: usize, drafts: bool, streams: usize, window: usize, rank: usize, channel: ?mirror.Channel) !void {
+        /// The object must remain at a stable address after init: mirrored backends point to local. `sliced`
+        /// (TF_GLM_FILL=1, the same on every rank): prompts fill a chunk a step between rounds; set here, before the
+        /// mirror takes the lane backend's vtable.
+        pub fn init(self: *Self, gpa: std.mem.Allocator, engine: *E, context: usize, drafts: bool, streams: usize, window: usize, rank: usize, channel: ?mirror.Channel, sliced: bool) !void {
             if (streams < 1 or streams > backend.max_streams or window < 1 or window > backend.max_rows or rank > 3) return error.BadServingGeometry;
             self.* = .{ .gpa = gpa, .local = backend.Lanes(E).init(gpa, engine, drafts, context, window) };
             self.local.streams = streams;
+            self.local.sliced = sliced;
             self.local.follower = channel != null and rank != 0;
             if (channel) |wire| {
                 if (rank == 0) {
@@ -69,11 +72,26 @@ test "serving creates the GLM lane vtable and mirror-compatible notes" {
     const E = @import("flashnext").lane_backend.Toy;
     var e: E = .{ .gpa = gpa };
     var serving: Serving(E) = undefined;
-    try serving.init(gpa, &e, 4096, true, 2, 8, 0, null);
+    try serving.init(gpa, &e, 4096, true, 2, 8, 0, null, false);
     defer serving.deinit();
     const be = serving.laneBackend();
     try std.testing.expect(be.ptr == @as(*anyopaque, @ptrCast(&serving.local)));
     try std.testing.expectEqual(@as(u32, 2), serving.facts().max_streams);
     try std.testing.expectEqual(@as(u32, 16), serving.facts().batch_rows);
+    // TF_GLM_FILL off: whole passes (bursts share one), no fills between rounds
+    try std.testing.expect(be.vtable.prefill_begin == null and be.vtable.fill_step == null);
+    try std.testing.expect(be.vtable.prefill_many != null or !@hasDecl(E, "prefillMany"));
     _ = Serving(E).follow;
+}
+
+test "TF_GLM_FILL: serving takes the lane backend's vtable after the switch, so prompts fill in slices between rounds (no bursts)" {
+    const gpa = std.testing.allocator;
+    const E = @import("flashnext").lane_backend.Toy;
+    var e: E = .{ .gpa = gpa };
+    var serving: Serving(E) = undefined;
+    try serving.init(gpa, &e, 4096, true, 2, 8, 0, null, true);
+    defer serving.deinit();
+    const be = serving.laneBackend();
+    try std.testing.expect(be.vtable.prefill_begin != null and be.vtable.fill_step != null);
+    try std.testing.expect(be.vtable.prefill_many == null);
 }

@@ -119,6 +119,7 @@ pub const Rig = struct {
 
     pub const Opts = struct {
         stepped: bool = false,
+        sliced: bool = false, // the backend fills prompts in slices between rounds (Fake.backendSliced: GLM's TF_GLM_FILL)
         burst: bool = false, // the backend prefills a burst's prompts one after another in one call (Fake.backendBurst)
         lanes: u32 = 2,
         budget: u64 = 1 << 20, // the store's bytes (Rig.bytes: 64 + 4 a token)
@@ -130,7 +131,7 @@ pub const Rig = struct {
         errdefer gpa.destroy(r);
         r.* = .{ .cfg = undefined, .target = .{ .gpa = gpa }, .core = undefined, .store = undefined, .tier = .{ .gpa = gpa, .codec = .{ .ctx = r, .pack = pack, .unpack = unpack } }, .host = undefined };
         r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-        const backend = if (o.stepped) r.target.stepped() else if (o.burst) r.target.backendBurst() else r.target.backend();
+        const backend = if (o.stepped) r.target.stepped() else if (o.sliced) r.target.backendSliced() else if (o.burst) r.target.backendBurst() else r.target.backend();
         r.core = lanes.Engine.init(gpa, &r.cfg, backend, r.clock.clock());
         r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } }, .{ .min_gap = 4, .min_prompt = 0 }, o.budget);
         r.store.setTier(r.tier.tier(), 0);
@@ -1138,6 +1139,39 @@ test "a long cold pass waits while a request is parked on its restore, a short o
     try std.testing.expectEqual(@as(u64, 1), c.prefills_held);
     try std.testing.expectEqual(@as(u64, 0), c.prefills_held_expired);
     try std.testing.expectEqual(@as(u64, 0), c.parked);
+}
+
+test "with prompts filling in slices between rounds (GLM's TF_GLM_FILL) no long pass is held for others' restores: it fills while the restore waits" {
+    var a: Box = .{};
+    defer a.deinit();
+    var p: Box = .{};
+    defer p.deinit();
+    const r = try Rig.createWith(.{ .load_ms = 5 }, .{ .hold_min = 8, .sliced = true });
+    defer r.destroy();
+    r.tier.gate.store(false, .release);
+    _ = try r.point(&t2, 8);
+    const e = r.host.engine();
+    const areq: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try e.submit(1, &areq, a.sink());
+    try r.until(struct {
+        fn ok(st: api.CacheStats) bool {
+            return st.restore_waits == 1;
+        }
+    }.ok);
+    // a long cold prompt (past hold_min) arrives while the restore cannot install: its fill runs at once
+    const preq: Request = .{ .prompt = &cold12, .max_tokens = 2 };
+    try e.submit(2, &preq, p.sink());
+    try std.testing.expectEqual(Reason.length, p.wait());
+    try p.exact(&cold12);
+    try std.testing.expect(a.finished() == null); // still parked on its restore
+    r.tier.gate.store(true, .release);
+    try std.testing.expectEqual(Reason.length, a.wait());
+    try std.testing.expectEqual(@as(?u32, 8), a.cached);
+    try a.exact(&t2);
+    const c = r.stats();
+    try std.testing.expectEqual(@as(u64, 0), c.prefills_held);
+    try std.testing.expectEqual(@as(u64, 0), c.prefills_held_expired);
+    try std.testing.expect(r.target.fill_steps > 0);
 }
 
 test "a held pass runs after TF_SPILL_DEFER_MS while the restore it waited for still has not installed" {

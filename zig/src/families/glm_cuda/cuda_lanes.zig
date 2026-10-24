@@ -137,14 +137,25 @@ pub fn Lanes(comptime E: type) type {
             first: ?u64 = null,
         };
 
-        /// A prompt filling in slices: the engine's fill of the segment in progress (up to the next mark, or to
-        /// the end), the state the segment resumed from, and where the pass stands.
+        /// A prompt filling a chunk a step (TF_GLM_FILL): the engine's fill of the segment in progress (up to the next
+        /// mark it keeps at, or to the end), where the pass stands and how it goes on from there. No kept state is held
+        /// across steps (the store may drop one between them): a resume is restored at the begin, and after a mark the
+        /// next segment goes on from the sequence's own rows (`live`), as pass() does from the state just kept.
         const Filling = struct {
-            fl: FillPtr,
-            cur: ?SnapPtr = null,
-            owned: bool = false,
-            at: usize = 0,
+            fl: ?FillPtr = null,
             final: bool = false,
+            /// the rows the sequence holds: the resume's, then each segment's end
+            at: usize = 0,
+            /// the next segment goes on from the sequence's rows at `at` (live_from), not from a state
+            live: bool = false,
+            /// the next of the stream's marks to consider
+            mark: usize = 0,
+            /// the begin's order: a step advances the oldest fill
+            order: u64 = 0,
+            /// a prompt with pictures or clips ran whole at its begin: in at the next step
+            whole: bool = false,
+            /// structured output's bits for the first token (gpa-owned; the last segment's draw)
+            mask: []u32 = &.{},
         };
 
         gpa: std.mem.Allocator,
@@ -184,9 +195,10 @@ pub fn Lanes(comptime E: type) type {
         follower: bool = false,
         /// rank 0 at two ranks: where the store's decisions go to rank 1 (cuda_mirror's Leader.note)
         notes: ?Notes = null,
-        /// prompts fill in slices between rounds (prefill_begin / prefill_step), `fill_layers` layers a step
+        /// TF_GLM_FILL: prompts fill a chunk a step between rounds (prefill_begin / fill_step), every rank alike
         sliced: bool = false,
-        fill_layers: usize = 8,
+        /// fills begun (their order)
+        fills: u64 = 0,
         lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
         /// the last verify's lanes whose windows wait for their commits: committed before the next forward
         opened: std.ArrayList(*Lane) = .empty,
@@ -256,7 +268,9 @@ pub fn Lanes(comptime E: type) type {
 
         // -- prompts filling between rounds (the lanes core's prefill_begin / prefill_step) --------------------
 
-        /// The prefill's admission and agreements, its resume made, the first segment's fill started.
+        /// The prefill's admission and agreements, its resume restored, the first segment's fill started (the resume's
+        /// restore runs in it, now: the store may drop the state before the first step). A prompt with pictures or clips
+        /// runs whole here instead (its rows come by broadcast inside one prefill): in at the next step.
         fn prefillBeginFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
             const self = of(ptr);
             const e = self.e;
@@ -281,81 +295,150 @@ pub fn Lanes(comptime E: type) type {
                 if (!here) from = null;
             }
             self.placed(l);
-            var f: Filling = .{ .fl = undefined };
+            const order = self.fills;
+            self.fills += 1;
+            if (s.media != null) {
+                e.bind(l.seq);
+                const first = self.pass(s, l, from) catch |err| {
+                    self.dropLane(s, l);
+                    return self.lost("a prompt's prefill", err);
+                };
+                l.first = self.take(first);
+                l.fill = .{ .whole = true, .order = order };
+                return;
+            }
+            var f: Filling = .{ .order = order };
             if (from) |k| {
                 if (k.keeper) |kp| e.copyPrefix(l.seq, kp, k.snap.pos, k.snap.mtp_len) catch |err| {
                     self.dropLane(s, l);
                     return self.lost("a prompt's resume", err);
                 };
-                f.cur = k.snap;
                 f.at = k.snap.pos;
             }
             s.cached = @intCast(f.at);
             s.reuse_failed = requested and from == null;
             self.dropTentative();
-            self.startSegment(s, l, &f) catch |err| {
+            // TF_GLM_KV_SHARD_TWINS: no borrowing here (a twin would be held across rounds and placements): the fill's
+            // chunks fetch their history as an unborrowed prompt's do
+            // structured output: the first token's bits now (rank 0's grammar, or the Leader's for rank 1), kept for the
+            // last segment's draw
+            if (comptime masked) {
+                var bits: ?[]u32 = null;
+                const m = self.firstMask(s, &bits) catch |err| {
+                    self.dropLane(s, l);
+                    return self.lost("a prompt's first-token bits", err);
+                };
+                f.mask = bits orelse (self.gpa.dupe(u32, m) catch |err| {
+                    self.dropLane(s, l);
+                    return self.lost("a prompt's first-token bits", err);
+                });
+            }
+            self.startSegment(s, l, &f, if (from) |k| k.snap else null) catch |err| {
+                self.gpa.free(f.mask);
                 self.dropLane(s, l);
                 return self.lost("a prompt's fill", err);
             };
             l.fill = f;
         }
 
-        /// The next segment's fill: up to the next mark (its state kept there), else to the prompt's end.
-        fn startSegment(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling) !void {
+        /// The next segment's fill, as pass() makes its next prefill: up to the next mark every rank has room to keep at
+        /// (asked first, as pass() asks), else to the prompt's end with the first token's bits. From `from` (the
+        /// begin's kept state), the sequence's own rows at `at` (`live`), or 0.
+        fn startSegment(self: *Self, s: *lanes.Stream, l: *Lane, f: *Filling, from: ?SnapPtr) !void {
+            const e = self.e;
             const ids = s.prompt();
-            const next_mark: ?u32 = for (s.reuse.marks) |m| {
-                if (m > f.at and m < ids.len) break m;
-            } else null;
-            if (next_mark) |m| {
-                f.fl = try self.e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = f.cur });
+            const marks = s.reuse.marks;
+            const live: ?usize = if (f.live) f.at else null;
+            while (f.mark < marks.len) {
+                const m = marks[f.mark];
+                f.mark += 1;
+                if (m <= f.at or m >= ids.len) continue;
+                const room = if (comptime @hasDecl(E, "keepFits")) e.keepFits(self.stateBytes(m)) else true;
+                if (!(try self.agreeOn(room))) {
+                    std.log.warn("prompt cache: no state kept at {d} tokens (a rank is at its keep floor)", .{m});
+                    continue;
+                }
+                f.fl = try e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = from, .live_from = live });
                 f.final = false;
-            } else {
-                f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = f.cur });
-                f.final = true;
+                return;
             }
+            f.fl = try e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = from, .live_from = live, .mask = f.mask });
+            f.final = true;
         }
 
-        /// `fill_layers` more layers of every filling prompt; a segment that ends keeps its mark's state and
-        /// starts the next; a prompt that is in draws its first token (`first` returns it).
+        /// One chunk of the oldest filling prompt (one in all: the rounds between steps wait for no more); a segment that
+        /// ends keeps its mark's state as pass() does (the save's outcome agreed, the store told, rank 1 told at once:
+        /// each segment is a pass to the notes) and starts the next; a prompt that is in has its first token. A prompt
+        /// that ran whole at its begin is in now too.
         fn prefillStepFn(ptr: *anyopaque, streams: []const *lanes.Stream, states: []be.FillState) anyerror!void {
             const self = of(ptr);
             try self.agree(null); // nothing to prepare: the ranks only meet before the slices' collectives
-            for (streams, states) |s, *st| {
+            var oldest: ?usize = null;
+            var order: u64 = std.math.maxInt(u64);
+            for (streams, states, 0..) |s, *st, i| {
                 const l = self.lanes.get(s) orelse return error.UnknownStream;
                 const f = &(l.fill orelse return error.NotFilling);
-                const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
-                if (!done) continue;
-                if (!f.final) {
-                    const m: u32 = @intCast(f.fl.prompt.len);
-                    const snap = f.fl.kept orelse return self.lost("a prompt's fill", error.NoStateKept);
-                    f.fl.kept = null; // the pass's now
-                    self.e.fillFree(f.fl);
-                    if (f.owned) self.e.freeSnapshot(f.cur.?);
-                    f.cur = snap;
-                    f.owned = true;
-                    if (self.keep(l, snap, m, s.prompt())) |k| {
-                        f.owned = false;
-                        self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| return self.lost("a prompt's fill", err);
-                    } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
-                    if (s.reuse.hook) |h| h.at(h.ptr, s, m);
-                    f.at = m;
-                    self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
+                if (f.whole) {
+                    l.fill = null;
+                    st.* = .done;
                     continue;
                 }
-                _ = self.take(f.fl.first);
-                self.e.fillFree(f.fl);
-                if (f.owned) self.e.freeSnapshot(f.cur.?);
-                l.fill = null;
-                self.endPass();
-                st.* = .done;
+                if (f.order < order) {
+                    order = f.order;
+                    oldest = i;
+                }
             }
+            const i = oldest orelse return;
+            const s = streams[i];
+            const l = self.lanes.get(s).?;
+            const f = &l.fill.?;
+            const fl = f.fl.?;
+            const done = self.e.fillStep(fl, 1) catch |err| return self.lost("a prompt's fill", err);
+            if (!done) return;
+            if (!f.final) {
+                const m: u32 = @intCast(fl.prompt.len);
+                const snap = fl.kept;
+                fl.kept = null;
+                self.e.fillFree(fl);
+                f.fl = null;
+                f.at = m;
+                f.live = true;
+                // the save's outcome, agreed as pass() agrees it: a state one rank holds alone is no use
+                const all = self.agreeOn(snap != null) catch |err| {
+                    if (snap) |k| self.e.freeSnapshot(k);
+                    return err;
+                };
+                if (!all) {
+                    std.log.warn("prompt cache: no state kept at {d} tokens (a save was refused)", .{m});
+                    if (snap) |k| self.e.freeSnapshot(k);
+                } else {
+                    if (self.keep(l, snap.?, m, s.prompt())) |k| {
+                        self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| {
+                            self.freeKept(k);
+                            return self.lost("a prompt's fill", err);
+                        };
+                    } else |err| {
+                        std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
+                        self.e.freeSnapshot(snap.?);
+                    }
+                    if (s.reuse.hook) |h| h.at(h.ptr, s, m);
+                }
+                self.endPass();
+                self.startSegment(s, l, f, null) catch |err| return self.lost("a prompt's fill", err);
+                return;
+            }
+            l.first = self.take(fl.first);
+            self.e.fillFree(fl);
+            self.gpa.free(f.mask);
+            l.fill = null;
+            self.endPass();
+            states[i] = .done;
         }
 
         fn stopFill(self: *Self, l: *Lane) void {
-            if (comptime !@hasDecl(E, "fillBegin")) return; // an engine without fills never starts one
             const f = l.fill orelse return;
-            self.e.fillFree(f.fl);
-            if (f.owned) self.e.freeSnapshot(f.cur.?);
+            if (comptime @hasDecl(E, "fillBegin")) if (f.fl) |fl| self.e.fillFree(fl); // an engine without fills never starts one
+            self.gpa.free(f.mask);
             l.fill = null;
         }
 
@@ -1618,6 +1701,11 @@ const MiniEngine = struct {
     lent_fills: usize = 0, // prefillWith calls whose sequence held borrowed rows, held (pinned) all along
     carries: usize = 0, // resumes whose state's rows a carry brought
     refused_small: usize = 0,
+    chunk: usize = 32, // a sliced fill's rows a step
+    chunk_log: std.ArrayList([3]usize) = .empty, // every fill step: [sequence, from, to)
+    fills_live: usize = 0,
+    lent_chunks: usize = 0, // fill steps whose sequence held borrowed rows
+    media_passes: usize = 0, // prefillWith calls with pictures or clips
 
     fn hash(tokens: []const u32) u32 {
         return @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(tokens)));
@@ -1718,9 +1806,75 @@ const MiniEngine = struct {
         }
         try q.tokens.appendSlice(e.gpa, prompt[q.tokens.items.len..]);
         const kept: ?*Snap = if (o.keep_at) |k| (if (e.refuse_keep or e.refuse_keep_at == k) null else try e.snapOf(prompt[0..k])) else null;
-        return .{ .first = hash(q.tokens.items), .kept = kept };
+        if (o.media != null) e.media_passes += 1;
+        return .{ .first = drawOf(q.tokens.items, o.mask), .kept = kept };
+    }
+    /// The first draw: the hash of every token, moved by the first token's bits when the pass was given any (so a pass
+    /// that dropped them draws another token).
+    pub fn drawOf(tokens: []const u32, mask: []const u32) u32 {
+        return hash(tokens) ^ (if (mask.len > 0) mask[0] else 0);
+    }
+
+    // -- sliced fills (the engine's Fill): prefillWith's start at fillBegin, then `chunk` rows a fillStep ----------
+
+    pub const Fill = struct {
+        seq: *Seq,
+        prompt: []const u32,
+        o: PrefillOptions,
+        at: usize,
+        kept: ?*Snap = null,
+        first: u32 = 0,
+        done: bool = false,
+    };
+    pub fn fillBegin(e: *MiniEngine, q: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
+        _ = sampling;
+        if (o.media != null) return error.FillWithMedia;
+        e.bound = q;
+        // the start as prefillWith makes it (the same checks, the same trace entry for the pass)
+        if (o.live_from) |p| {
+            if (o.resume_from != null or q.tokens.items.len != p or !std.mem.eql(u32, q.tokens.items, prompt[0..p])) return error.ResumeMustExtend;
+        } else if (o.resume_from) |snap| {
+            if (snap.pos >= prompt.len or !std.mem.eql(u32, snap.tokens, prompt[0..snap.pos])) return error.ResumeOtherPrompt;
+            q.tokens.clearRetainingCapacity();
+            try q.tokens.appendSlice(e.gpa, snap.tokens);
+            e.resumed += 1;
+        } else q.tokens.clearRetainingCapacity();
+        try e.trace.append(e.gpa, .{ q.tokens.items.len, prompt.len });
+        const fl = try e.gpa.create(Fill);
+        fl.* = .{ .seq = q, .prompt = prompt, .o = o, .at = q.tokens.items.len };
+        e.fills_live += 1;
+        return fl;
+    }
+    pub fn fillStep(e: *MiniEngine, fl: *Fill, chunks: usize) !bool {
+        _ = chunks;
+        if (fl.done) return true;
+        const q = fl.seq;
+        // nothing else wrote this sequence between steps, and its borrowed rows (if any) are still held
+        if (q.tokens.items.len != fl.at) return error.FillSequenceMoved;
+        if (q.lent) {
+            if (!e.pool.?.holding(q.eid.?)) return error.TwinNotHeld;
+            e.lent_chunks += 1;
+        }
+        const end = @min(fl.at + e.chunk, fl.prompt.len);
+        try q.tokens.appendSlice(e.gpa, fl.prompt[fl.at..end]);
+        try e.chunk_log.append(e.gpa, .{ @intFromPtr(q), fl.at, end });
+        fl.at = end;
+        if (end < fl.prompt.len) return false;
+        if (fl.o.keep_at) |k| fl.kept = if (e.refuse_keep or e.refuse_keep_at == k) null else try e.snapOf(fl.prompt[0..k]);
+        fl.first = drawOf(q.tokens.items, fl.o.mask);
+        fl.done = true;
+        return true;
+    }
+    pub fn fillFree(e: *MiniEngine, fl: *Fill) void {
+        if (fl.kept) |k| e.freeSnapshot(k);
+        e.gpa.destroy(fl);
+        e.fills_live -= 1;
     }
     pub fn commitWindow(_: *MiniEngine, _: usize, _: usize) !void {
+        return error.NotUsed;
+    }
+    /// (a masked draw: the lanes then hand a pass its first token's bits, as to the GLM engine)
+    pub fn sampleWindowMasked(_: *MiniEngine, _: usize, _: ?lanes.Sampling, _: []u32, _: []const u32) !void {
         return error.NotUsed;
     }
     pub fn placement(e: *MiniEngine, s: *const Seq) ?shard.Placement {
@@ -1770,6 +1924,7 @@ const MiniEngine = struct {
         for (e.disk.items) |d| e.gpa.free(d.tokens);
         e.disk.deinit(e.gpa);
         e.trace.deinit(e.gpa);
+        e.chunk_log.deinit(e.gpa);
         if (e.pool) |*p| p.deinit();
     }
 };
@@ -2409,6 +2564,444 @@ test "a save refused on rank 1 only is kept by no rank; both go on from the live
 
 test "a save refused on rank 0 only is kept by no rank; both go on from the live rows and keep at the next mark" {
     try lateRefusal(0);
+}
+
+// -- TF_GLM_FILL: prompts filling a chunk a step between rounds (prefill_begin / fill_step) -------------------------
+
+/// Two ranks filling in slices, each on its own gate whose other rank's votes are scripted (the ranks run each call one
+/// after the other, rank 0 first); rank 1 takes rank 0's notes after every call, as the mirror delivers them before
+/// its next one.
+const SlicedPair = struct {
+    e0: MiniEngine,
+    e1: MiniEngine,
+    r0: Lanes(MiniEngine),
+    r1: Lanes(MiniEngine),
+    sink: NoteSink,
+    g0: TestGate,
+    g1: TestGate,
+    const B = Lanes(MiniEngine);
+    /// `votes1`: what rank 0 hears from rank 1 at each of its asks; `votes0`: what rank 1 hears from rank 0
+    fn init(p: *SlicedPair, gpa: std.mem.Allocator, votes0: []const bool, votes1: []const bool) void {
+        p.e0 = .{ .gpa = gpa };
+        p.e1 = .{ .gpa = gpa };
+        p.r0 = B.init(gpa, &p.e0, true, 1 << 20, 8);
+        p.r1 = B.init(gpa, &p.e1, true, 1 << 20, 8);
+        p.r0.sliced = true;
+        p.r1.sliced = true;
+        p.r1.follower = true;
+        p.sink = .{ .gpa = gpa };
+        p.r0.notes = .{ .ptr = &p.sink, .send = NoteSink.send };
+        p.g0 = .{ .other = votes1 };
+        p.g1 = .{ .other = votes0 };
+        p.r0.gate = .{ .ptr = &p.g0, .agree = TestGate.agree, .fatal = TestGate.fatal };
+        p.r1.gate = .{ .ptr = &p.g1, .agree = TestGate.agree, .fatal = TestGate.fatal };
+    }
+    fn deinit(p: *SlicedPair) void {
+        p.r0.deinit();
+        p.r1.deinit();
+        p.sink.deinit();
+        p.e0.deinit();
+        p.e1.deinit();
+    }
+    fn begin(p: *SlicedPair, s0: *lanes.Stream, s1: *lanes.Stream) !void {
+        try B.prefillBeginFn(&p.r0, s0);
+        try B.prefillBeginFn(&p.r1, s1);
+        try p.sink.take(&p.r1);
+    }
+    /// One fill_step on both ranks over the streams filling (each rank its own); both report the same states.
+    fn step(p: *SlicedPair, ss0: []const *lanes.Stream, ss1: []const *lanes.Stream, states: []be.FillState) !void {
+        var other: [8]be.FillState = undefined;
+        @memset(states, .filling);
+        @memset(other[0..ss1.len], .filling);
+        try B.prefillStepFn(&p.r0, ss0, states);
+        try B.prefillStepFn(&p.r1, ss1, other[0..ss1.len]);
+        try p.sink.take(&p.r1);
+        try std.testing.expectEqualSlices(be.FillState, states, other[0..ss1.len]);
+    }
+    /// One stream's fill to its end: the steps it took.
+    fn fill(p: *SlicedPair, s0: *lanes.Stream, s1: *lanes.Stream) !usize {
+        try p.begin(s0, s1);
+        var steps: usize = 0;
+        var st: [1]be.FillState = undefined;
+        while (true) {
+            try p.step(&.{s0}, &.{s1}, &st);
+            steps += 1;
+            if (st[0] == .done) return steps;
+            if (steps > 1000) return error.FillNeverEnds;
+        }
+    }
+};
+
+/// The kept states' positions of a rank, sorted.
+fn keptAts(gpa: std.mem.Allocator, r: anytype) ![]u32 {
+    const out = try gpa.alloc(u32, r.kept.items.len);
+    for (out, r.kept.items) |*o, k| o.* = k.at;
+    std.mem.sort(u32, out, {}, std.sort.asc(u32));
+    return out;
+}
+
+const all_yes: []const bool = &@as([64]bool, @splat(true));
+
+test "TF_GLM_FILL: a prompt fills a chunk a step and ends as its whole pass: the same first token, rows, kept marks and notes on both ranks" {
+    const gpa = std.testing.allocator;
+    const prompt = testPrompt(7);
+    var longer: [300]u32 = undefined;
+    @memcpy(longer[0..150], &prompt);
+    for (longer[150..], 0..) |*t, i| t.* = @intCast(500 + i);
+    // the whole pass (Pair, rank 0 then rank 1): cold at marks 64 and 128, then a longer prompt resumed from 128 that
+    // keeps at 256
+    var w: Pair = undefined;
+    w.init(gpa, all_yes);
+    defer w.deinit();
+    w.e0.spill_on = true; // (the adopter writes the first state out at the second keep)
+    const wh = w.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var wa: Adopter = .{ .hooks = wh };
+    var w1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &wa, .at = Adopter.at } } });
+    defer w1.deinit(gpa);
+    try w.pass(&w1);
+    const wk = wa.saved[1];
+    var w2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &longer, .max_new = 4, .reuse = .{ .saved = wk, .at = 128, .marks = &.{256}, .hook = .{ .ptr = &wa, .at = Adopter.at } } });
+    defer w2.deinit(gpa);
+    var w2b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &longer, .max_new = 4, .reuse = .{ .saved = w.r1.savedFor(w.r0.keptOf(wk).?.key), .at = 128, .marks = &.{256} } });
+    defer w2b.deinit(gpa);
+    try Lanes(MiniEngine).prefillFn(&w.r0, &w2);
+    try Lanes(MiniEngine).prefillFn(&w.r1, &w2b);
+    try w.sink.take(&w.r1);
+    const whole_first = try firstToken(Lanes(MiniEngine), &w.r0, &w2);
+    // the same two prompts filling a chunk a step (32 rows) on two ranks
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    p.e0.spill_on = true;
+    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var adopter: Adopter = .{ .hooks = hooks };
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    // 64, 64 and 22 rows: two chunks, two, one
+    try std.testing.expectEqual(@as(usize, 5), try p.fill(&s1, &s1));
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s1));
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r1, &s1));
+    try std.testing.expectEqual(@as(usize, 2), adopter.n);
+    const k = adopter.saved[1];
+    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &longer, .max_new = 4, .reuse = .{ .saved = k, .at = 128, .marks = &.{256}, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s2.deinit(gpa);
+    var s2b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &longer, .max_new = 4, .reuse = .{ .saved = p.r1.savedFor(p.r0.keptOf(k).?.key), .at = 128, .marks = &.{256} } });
+    defer s2b.deinit(gpa);
+    _ = try p.fill(&s2, &s2b);
+    try std.testing.expectEqual(@as(u32, 128), s2.cached);
+    try std.testing.expectEqual(@as(u32, 128), s2b.cached);
+    try std.testing.expectEqual(whole_first, try firstToken(SlicedPair.B, &p.r0, &s2));
+    try std.testing.expectEqual(whole_first, try firstToken(SlicedPair.B, &p.r1, &s2b));
+    // the same passes (each segment's rows) as the whole pass, on both ranks, every row once
+    try std.testing.expectEqualSlices([2]usize, w.e0.trace.items, p.e0.trace.items);
+    try std.testing.expectEqualSlices([2]usize, p.e0.trace.items, p.e1.trace.items);
+    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 64 }, .{ 64, 128 }, .{ 128, 150 }, .{ 128, 256 }, .{ 256, 300 } }, p.e0.trace.items);
+    var covered: usize = 0;
+    for (p.e0.chunk_log.items) |c| covered += c[2] - c[1];
+    try std.testing.expectEqual(@as(usize, 150 + (300 - 128)), covered);
+    // the same kept marks as the whole pass, adopted on both ranks
+    const wk0 = try keptAts(gpa, &w.r0);
+    defer gpa.free(wk0);
+    const wk1 = try keptAts(gpa, &w.r1);
+    defer gpa.free(wk1);
+    const k0 = try keptAts(gpa, &p.r0);
+    defer gpa.free(k0);
+    const k1 = try keptAts(gpa, &p.r1);
+    defer gpa.free(k1);
+    try std.testing.expectEqualSlices(u32, &.{ 64, 128, 256 }, wk0);
+    try std.testing.expectEqualSlices(u32, wk0, wk1);
+    try std.testing.expectEqualSlices(u32, wk0, k0);
+    try std.testing.expectEqualSlices(u32, k0, k1);
+    try std.testing.expectEqual(@as(usize, 0), p.r0.tentative.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.r1.tentative.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.e0.fills_live + p.e1.fills_live);
+    SlicedPair.B.releaseFn(&p.r0, &s1);
+    SlicedPair.B.releaseFn(&p.r1, &s1);
+    SlicedPair.B.releaseFn(&p.r0, &s2);
+    SlicedPair.B.releaseFn(&p.r1, &s2b);
+    Lanes(MiniEngine).releaseFn(&w.r0, &w2);
+    Lanes(MiniEngine).releaseFn(&w.r1, &w2b);
+}
+
+test "TF_GLM_FILL: a step advances one chunk in all, the oldest fill's; a later fill waits its turn" {
+    const gpa = std.testing.allocator;
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    const a = testPrompt(3);
+    const b = testPrompt(5);
+    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
+    defer sa.deinit(gpa);
+    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = b[0..70], .max_new = 4 });
+    defer sb.deinit(gpa);
+    try p.begin(&sa, &sa);
+    try p.begin(&sb, &sb);
+    var st: [2]be.FillState = undefined;
+    // the host lists the newer one first: the step still takes the older one's chunk, and only that
+    for (0..5) |i| {
+        try p.step(&.{ &sb, &sa }, &.{ &sb, &sa }, &st);
+        try std.testing.expectEqual(i + 1, p.e0.chunk_log.items.len);
+        try std.testing.expectEqual(@intFromPtr(p.r0.lanes.get(&sa).?.seq), p.e0.chunk_log.items[i][0]);
+        try std.testing.expectEqual(be.FillState.filling, st[0]);
+        try std.testing.expectEqual(if (i == 4) be.FillState.done else be.FillState.filling, st[1]);
+    }
+    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r0, &sa));
+    // then the other's three chunks
+    for (0..3) |i| {
+        try p.step(&.{&sb}, &.{&sb}, st[0..1]);
+        try std.testing.expectEqual(@intFromPtr(p.r0.lanes.get(&sb).?.seq), p.e0.chunk_log.items[5 + i][0]);
+    }
+    try std.testing.expectEqual(be.FillState.done, st[0]);
+    try std.testing.expectEqual(MiniEngine.hash(b[0..70]), try firstToken(SlicedPair.B, &p.r0, &sb));
+    try std.testing.expectEqual(MiniEngine.hash(b[0..70]), try firstToken(SlicedPair.B, &p.r1, &sb));
+    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r1, &sa));
+    try std.testing.expectEqual(p.e0.chunk_log.items.len, p.e1.chunk_log.items.len);
+    SlicedPair.B.releaseFn(&p.r0, &sa);
+    SlicedPair.B.releaseFn(&p.r1, &sa);
+    SlicedPair.B.releaseFn(&p.r0, &sb);
+    SlicedPair.B.releaseFn(&p.r1, &sb);
+}
+
+test "TF_GLM_FILL: a fill cancelled between its steps frees its fill and sequence on both ranks; its kept marks stay, the next fill runs whole" {
+    const gpa = std.testing.allocator;
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var adopter: Adopter = .{ .hooks = hooks };
+    const prompt = testPrompt(9);
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    try p.begin(&s1, &s1);
+    var st: [1]be.FillState = undefined;
+    for (0..3) |_| try p.step(&.{&s1}, &.{&s1}, &st); // past the 64 mark, one chunk into the next segment
+    try std.testing.expectEqual(@as(usize, 1), adopter.n);
+    try std.testing.expectEqual(@as(usize, 1), p.e0.fills_live);
+    // the host discards it between steps: a release on each rank (the mirror's)
+    SlicedPair.B.releaseFn(&p.r0, &s1);
+    SlicedPair.B.releaseFn(&p.r1, &s1);
+    try std.testing.expectEqual(@as(usize, 0), p.e0.fills_live + p.e1.fills_live);
+    try std.testing.expectEqual(@as(usize, 0), p.e0.seqs + p.e1.seqs);
+    try std.testing.expectEqual(@as(usize, 1), p.r0.kept.items.len);
+    try std.testing.expectEqual(@as(usize, 1), p.r1.kept.items.len);
+    try std.testing.expectEqual(@as(usize, 1), p.e0.snaps); // the adopted 64 state only
+    try std.testing.expectEqual(@as(usize, 1), p.e1.snaps);
+    // a fresh fill of the same prompt from that state ends as a fresh pass would
+    const k = adopter.saved[0];
+    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .reuse = .{ .saved = k, .at = 64 } });
+    defer s2.deinit(gpa);
+    var s2b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4, .reuse = .{ .saved = p.r1.savedFor(p.r0.keptOf(k).?.key), .at = 64 } });
+    defer s2b.deinit(gpa);
+    _ = try p.fill(&s2, &s2b);
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r0, &s2));
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r1, &s2b));
+    SlicedPair.B.releaseFn(&p.r0, &s2);
+    SlicedPair.B.releaseFn(&p.r1, &s2b);
+}
+
+test "TF_GLM_FILL: a keep at a rank's keep floor and a save the engine refuses go as in the whole pass: no state, the fill goes on from its live rows, every row once" {
+    const gpa = std.testing.allocator;
+    const B = Lanes(MiniEngine);
+    const prompt = testPrompt(11);
+    const Case = struct { fits: bool, refuse_all: bool, refuse_at: ?usize, kept: usize, trace: []const [2]usize };
+    // one rank: no room at either mark (asked before each segment: one segment); both saves refused (each segment goes
+    // on live); the save at 128 refused only (the 64 state kept)
+    for ([_]Case{
+        .{ .fits = false, .refuse_all = false, .refuse_at = null, .kept = 0, .trace = &.{.{ 0, 150 }} },
+        .{ .fits = true, .refuse_all = true, .refuse_at = null, .kept = 0, .trace = whole_pass },
+        .{ .fits = true, .refuse_all = false, .refuse_at = 128, .kept = 1, .trace = whole_pass },
+    }) |case| {
+        var e0: MiniEngine = .{ .gpa = gpa, .keep_fits = case.fits, .refuse_keep = case.refuse_all, .refuse_keep_at = case.refuse_at };
+        defer e0.deinit();
+        var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+        defer r0.deinit();
+        r0.sliced = true;
+        const hooks = r0.cacheHooks(1 << 30, .{}, 0, 5);
+        var adopter: Adopter = .{ .hooks = hooks };
+        var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+        defer s1.deinit(gpa);
+        try B.prefillBeginFn(&r0, &s1);
+        var st: [1]be.FillState = .{.filling};
+        var steps: usize = 0;
+        while (st[0] != .done and steps < 100) : (steps += 1) try B.prefillStepFn(&r0, &.{&s1}, &st);
+        try std.testing.expectEqual(@as(usize, 5), steps);
+        try std.testing.expectEqual(case.kept, adopter.n);
+        try std.testing.expectEqual(case.kept, r0.kept.items.len);
+        try std.testing.expectEqual(case.kept, e0.snaps);
+        try std.testing.expectEqualSlices([2]usize, case.trace, e0.trace.items);
+        var covered: usize = 0;
+        for (e0.chunk_log.items) |c| covered += c[2] - c[1];
+        try std.testing.expectEqual(@as(usize, 150), covered);
+        try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(B, &r0, &s1));
+        B.releaseFn(&r0, &s1);
+    }
+}
+
+test "TF_GLM_FILL: a save refused on rank 1 only is kept by no rank; both go on from the live rows and keep at the next mark" {
+    const gpa = std.testing.allocator;
+    // each rank's asks: begin (prepare, room at 64); a step each (agree) for chunks 0-32 and 32-64, then the save at 64
+    // (5th) and the room at 128; steps for 64-96 and 96-128, the save at 128 (9th); a step for 128-150
+    var votes1: [10]bool = @splat(true);
+    votes1[4] = false;
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, &votes1);
+    defer p.deinit();
+    p.e1.refuse_keep_at = 64;
+    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var adopter: Adopter = .{ .hooks = hooks };
+    const prompt = testPrompt(13);
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 5), try p.fill(&s1, &s1));
+    try std.testing.expectEqual(@as(usize, 10), p.g0.asked);
+    try std.testing.expectEqual(@as(usize, 10), p.g1.asked);
+    try std.testing.expectEqual(@as(usize, 1), adopter.n); // the 128 state only
+    try std.testing.expectEqual(@as(usize, 1), p.r0.kept.items.len);
+    try std.testing.expectEqual(@as(usize, 1), p.r1.kept.items.len);
+    try std.testing.expectEqual(@as(u32, 128), p.r1.kept.items[0].at);
+    try std.testing.expectEqualSlices([2]usize, whole_pass, p.e0.trace.items);
+    try std.testing.expectEqualSlices([2]usize, whole_pass, p.e1.trace.items);
+    try std.testing.expectEqual(@as(usize, 1), p.e0.snaps); // the state rank 0 took at 64 and no rank agreed is gone
+    try std.testing.expectEqual(@as(usize, 1), p.e1.snaps);
+    try std.testing.expectEqual(MiniEngine.hash(&prompt), try firstToken(SlicedPair.B, &p.r1, &s1));
+    SlicedPair.B.releaseFn(&p.r0, &s1);
+    SlicedPair.B.releaseFn(&p.r1, &s1);
+}
+
+test "TF_GLM_FILL: structured output's first-token bits reach the fill's last draw on both ranks, as in the whole pass" {
+    const gpa = std.testing.allocator;
+    const prompt = testPrompt(17);
+    const bits = [_]u32{ 0x5a5a, 3 };
+    // the whole pass with the bits (rank 1's way in: the stream's first_mask, which a Leader also sets on rank 0)
+    var w: Pair = undefined;
+    w.init(gpa, all_yes);
+    defer w.deinit();
+    var ws = try lanes.Stream.init(gpa, .{ .id = "w", .prompt = &prompt, .max_new = 4 });
+    defer ws.deinit(gpa);
+    ws.first_mask = &bits;
+    try Lanes(MiniEngine).prefillFn(&w.r0, &ws);
+    const whole = try firstToken(Lanes(MiniEngine), &w.r0, &ws);
+    try std.testing.expectEqual(MiniEngine.drawOf(&prompt, &bits), whole);
+    Lanes(MiniEngine).releaseFn(&w.r0, &ws);
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .reuse = .{ .marks = &.{64} } });
+    defer s1.deinit(gpa);
+    // the mirror's Leader sets first_mask for its call only: the fill keeps its own copy for the last segment
+    s1.first_mask = &bits;
+    try p.begin(&s1, &s1);
+    s1.first_mask = &.{};
+    var st: [1]be.FillState = .{.filling};
+    var steps: usize = 0;
+    while (st[0] != .done and steps < 100) : (steps += 1) try p.step(&.{&s1}, &.{&s1}, &st);
+    try std.testing.expectEqual(whole, try firstToken(SlicedPair.B, &p.r0, &s1));
+    try std.testing.expectEqual(whole, try firstToken(SlicedPair.B, &p.r1, &s1));
+    SlicedPair.B.releaseFn(&p.r0, &s1);
+    SlicedPair.B.releaseFn(&p.r1, &s1);
+}
+
+test "TF_GLM_FILL: a prompt with pictures runs whole at its begin (its rows come by broadcast inside one prefill) and is in at the next step, beside another fill's chunk" {
+    const gpa = std.testing.allocator;
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    const a = testPrompt(19);
+    const pic = testPrompt(23);
+    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &a, .max_new = 4 });
+    defer sa.deinit(gpa);
+    const media: lanes.Media = .{ .rows = &.{ 3, 4, 5 } };
+    var sm = try lanes.Stream.init(gpa, .{ .id = "m", .prompt = &pic, .max_new = 4, .media = &media });
+    defer sm.deinit(gpa);
+    try p.begin(&sa, &sa);
+    try p.begin(&sm, &sm);
+    try std.testing.expectEqual(@as(usize, 1), p.e0.media_passes);
+    try std.testing.expectEqual(@as(usize, 1), p.e1.media_passes);
+    try std.testing.expectEqual(@as(usize, 1), p.e0.fills_live); // the picture prompt's pass is no fill
+    var st: [2]be.FillState = undefined;
+    try p.step(&.{ &sa, &sm }, &.{ &sa, &sm }, &st);
+    try std.testing.expectEqual(be.FillState.filling, st[0]);
+    try std.testing.expectEqual(be.FillState.done, st[1]);
+    try std.testing.expectEqual(@as(usize, 1), p.e0.chunk_log.items.len); // the other fill's one chunk
+    try std.testing.expectEqual(MiniEngine.hash(&pic), try firstToken(SlicedPair.B, &p.r0, &sm));
+    try std.testing.expectEqual(MiniEngine.hash(&pic), try firstToken(SlicedPair.B, &p.r1, &sm));
+    while (st[0] != .done) try p.step(&.{&sa}, &.{&sa}, st[0..1]);
+    try std.testing.expectEqual(MiniEngine.hash(&a), try firstToken(SlicedPair.B, &p.r0, &sa));
+    for ([_]*lanes.Stream{ &sa, &sm }) |s| {
+        SlicedPair.B.releaseFn(&p.r0, s);
+        SlicedPair.B.releaseFn(&p.r1, s);
+    }
+}
+
+test "TF_GLM_KV_SHARD with TF_GLM_FILL: a fill borrows no rows (its history is fetched), so nothing is lent between its steps; the placements still check" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    var p: SlicedPair = undefined;
+    p.init(gpa, all_yes, all_yes);
+    defer p.deinit();
+    p.e0.pool = try Pool.initParts(gpa, 8 * 2048, 2);
+    p.e1.pool = try Pool.initParts(gpa, 8 * 2048, 2);
+    p.e0.check = 1;
+    p.e1.check = 1;
+    var big: [2200]u32 = undefined;
+    for (&big, 0..) |*t, i| t.* = @intCast(i * 13 % 997);
+    p.e0.chunk = 512;
+    p.e1.chunk = 512;
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &big, .max_new = 4, .reuse = .{ .marks = &.{2112} } });
+    defer s1.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 6), try p.fill(&s1, &s1)); // 2112 = 4 x 512 + 64, then 88
+    try std.testing.expectEqual(@as(usize, 0), p.e0.lent_chunks + p.e1.lent_chunks);
+    try std.testing.expectEqual(@as(usize, 0), p.e0.pool.?.rowsIn(1).twins + p.e1.pool.?.rowsIn(1).twins);
+    try std.testing.expectEqual(p.e0.pool.?.digest(), p.e1.pool.?.digest());
+    try std.testing.expectEqual(MiniEngine.hash(&big), try firstToken(SlicedPair.B, &p.r0, &s1));
+    SlicedPair.B.releaseFn(&p.r0, &s1);
+    SlicedPair.B.releaseFn(&p.r1, &s1);
+}
+
+test "TF_GLM_FILL: decode rounds of a live stream run between a long prompt's fill steps; both replies are their serial ones" {
+    const gpa = std.testing.allocator;
+    const Toy = @import("flashnext").lane_backend.Toy;
+    var t: Toy = .{ .gpa = gpa };
+    var b = Lanes(Toy).init(gpa, &t, true, 4096, 8);
+    defer b.deinit();
+    b.streams = 2;
+    b.sliced = true;
+    for (b.costs[0..8], 1..) |*c, width| c.* = .{ .width = @intCast(width), .ms = 8 + 0.3 * @as(f64, @floatFromInt(width)) };
+    b.cost_count = 8;
+    b.mtp_ms = 0.4;
+    var cfg = try lanes.Config.init(gpa, b.facts(), 8, 7);
+    defer cfg.deinit(gpa);
+    var clock: lanes.fake.FixedClock = .{};
+    var loop = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
+    defer loop.deinit();
+    try std.testing.expect(loop.slices());
+    var long: [600]u32 = undefined;
+    for (&long, 0..) |*x, i| x.* = @intCast(i % 41);
+    var sa = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &.{ 1, 2, 3 }, .max_new = 120 });
+    defer sa.deinit(gpa);
+    var sb = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &long, .max_new = 20 });
+    defer sb.deinit(gpa);
+    try std.testing.expect(try loop.beginStream(&sa));
+    while (loop.fillingCount() > 0) try loop.step();
+    try std.testing.expect(try loop.beginStream(&sb));
+    const rounds0 = t.rounds;
+    var steps: usize = 0;
+    while (loop.fillingCount() > 0) : (steps += 1) try loop.step();
+    // the long prompt took several steps, each with a round of the live stream
+    try std.testing.expect(steps >= 2);
+    try std.testing.expect(t.rounds - rounds0 >= steps - 1);
+    try std.testing.expect(sa.emitted().len > 1);
+    while (loop.activeCount() != 0) try loop.step();
+    for ([_]*lanes.Stream{ &sa, &sb }) |s| {
+        var serial: Toy = .{ .gpa = gpa };
+        const seq = try serial.newSeq(4096);
+        defer serial.freeSeq(seq);
+        serial.bind(seq);
+        const first = try serial.prefill(s.prompt(), s.sampling);
+        var result = try decode.serial(Toy, &serial, gpa, first, .{ .count = s.max_new });
+        defer result.deinit(gpa);
+        try std.testing.expectEqualSlices(u32, result.tokens.items, s.emitted());
+    }
 }
 
 test "a keep batch with a bad path commits nothing and leaves every window pending; the next good batch commits them" {
