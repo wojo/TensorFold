@@ -12,6 +12,9 @@
 //! A message is op u8, then its fields in this order, little endian, no padding, nothing after it:
 //!   keep      kept u64, at u32, point [32], group u64, shared u8, root [16], part opt u32, forks (u32 count, then
 //!             name [16] and at u32 each), origin opt (key [32], at u32)
+//!   keep_pictures   a keep's fields, then its pictures: u32 count (1..max_note_media), each start u32, len u32,
+//!             SHA-256 [32] (in order, not overlapping, starting before `at`), then placeholder u32 (a model id): a
+//!             point with pictures before its cut (a text point's keep is `keep`, its bytes unchanged)
 //!   begin     txn u64, kept u64, point [32], at u32, blocks u32
 //!   progress  txn u64, upto u32
 //!   cancel    txn u64, why u8 (Failure), forget u8
@@ -35,7 +38,8 @@ pub const Digest = [32]u8;
 /// before: points_part0/1), which only ranks of two builds could disagree on, and two builds pair only under forced
 /// identity exports (TF_GLM_ENGINE_ID and TF_GLM_RECIPE_PATCHES are in the fingerprint; the recipe's differ per build).
 /// The version is in every store's namespace too: at 1, spill v2 alone's stays ef6eb5b0's under the same identity
-/// exports (gpu-validation SA1).
+/// exports (gpu-validation SA1). Pictures' `keep_pictures` is a new op beside `keep`, not a bump: a text keep's bytes
+/// are unchanged, and only ranks of two builds (forced identity exports, as above) could disagree on it.
 pub const version: u16 = 1;
 
 pub const Op = enum(u8) {
@@ -49,6 +53,7 @@ pub const Op = enum(u8) {
     forget = 7, // drop the point, published or queued
     pump = 8, // rank 0 staged its queued writes for `budget_ns`: stage this rank's as long
     flush = 9, // a clean stop: stage and drain this rank's writes within `budget_ns`
+    keep_pictures = 10, // `keep` of a point with pictures before its cut: its pictures and the placeholder follow
     // asks
     has = 16, // does this rank hold every block of the point, published?
     validate = 17, // did this rank's copies of restore `txn` pass their checks?
@@ -103,6 +108,10 @@ pub const Keep = struct {
     /// the store's lineage of the write (its forks live in the decode arena)
     lineage: format.Lineage,
     origin: ?format.Origin = null,
+    /// the point's pictures (those starting before `at`, in order; empty: a text point, sent as `keep`) and the model
+    /// id their rows hold: the follower rebuilds rank 0's keyed and raw ids from its own model ids with them
+    media: []const format.Media = &.{},
+    placeholder: u32 = 0,
 };
 pub const Begin = struct { txn: u64, kept: u64, point: Digest, at: u32, blocks: u32 };
 pub const Progress = struct { txn: u64, upto: u32 };
@@ -149,6 +158,11 @@ pub const max_world = 4;
 
 /// A forks count past this is refused (core/spill format.Limits' default).
 pub const max_forks = 4096;
+/// A keep's pictures past this are refused (encode: TooManyPictures; decode: BadMessage); the tier writes no point
+/// with more (the DeepSeek port's max_keep_media).
+pub const max_note_media = 256;
+/// One picture's bytes in `keep_pictures`.
+const media_entry_bytes = 4 + 4 + 32;
 /// `has`: its blocks word's bit 31, set when a part follows (no point has 2^31 blocks).
 const has_part: u32 = 1 << 31;
 
@@ -174,7 +188,9 @@ const Out = struct {
 /// `m`'s bytes, appended to `list`.
 pub fn encode(list: *std.ArrayList(u8), gpa: std.mem.Allocator, m: Msg) !void {
     const o: Out = .{ .list = list, .gpa = gpa };
-    try o.int(u8, @backingInt(m.op()));
+    const pictures = m == .keep and m.keep.media.len > 0;
+    if (pictures) if (m.keep.media.len > max_note_media) return error.TooManyPictures;
+    try o.int(u8, @backingInt(if (pictures) Op.keep_pictures else m.op()));
     switch (m) {
         .keep => |k| {
             if (k.lineage.forks.len > max_forks) return error.TooManyForks;
@@ -195,6 +211,15 @@ pub fn encode(list: *std.ArrayList(u8), gpa: std.mem.Allocator, m: Msg) !void {
             if (k.origin) |g| {
                 try o.bytes(&g.key);
                 try o.int(u32, g.at);
+            }
+            if (pictures) {
+                try o.int(u32, @intCast(k.media.len));
+                for (k.media) |md| {
+                    try o.int(u32, md.start);
+                    try o.int(u32, md.len);
+                    try o.bytes(&md.digest);
+                }
+                try o.int(u32, k.placeholder);
             }
         },
         .begin => |b| {
@@ -268,7 +293,7 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !Msg {
     var i: In = .{ .bytes = bytes };
     const op: Op = @fromBackingInt(try i.int(u8));
     const m: Msg = switch (op) {
-        .keep => blk: {
+        .keep, .keep_pictures => blk: {
             var k: Keep = .{ .kept = try i.int(u64), .at = try i.end(), .point = try i.fixed(32), .group = try i.int(u64), .shared = try i.flag(), .lineage = .{ .root = try i.fixed(16) } };
             if (try i.flag()) k.lineage.part = try i.int(u32);
             const n = try i.int(u32);
@@ -278,6 +303,22 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !Msg {
             for (forks) |*f| f.* = .{ .name = try i.fixed(16), .at = try i.int(u32) };
             k.lineage.forks = forks;
             if (try i.flag()) k.origin = .{ .key = try i.fixed(32), .at = try i.int(u32) };
+            if (op == .keep_pictures) {
+                const np = try i.int(u32);
+                if (np == 0 or np > max_note_media) return error.BadMessage;
+                if (np > (bytes.len - i.at) / media_entry_bytes) return error.ShortMessage;
+                const media = try arena.alloc(format.Media, np);
+                var end: u64 = 0;
+                for (media) |*md| {
+                    md.* = .{ .start = try i.int(u32), .len = try i.int(u32), .digest = try i.fixed(32) };
+                    // in order, not overlapping, not empty, each starting before the cut
+                    if (md.len == 0 or md.start < end or md.start >= k.at) return error.BadMessage;
+                    end = @as(u64, md.start) + md.len;
+                }
+                k.media = media;
+                k.placeholder = try i.int(u32);
+                if (k.placeholder >= format.picture_ids) return error.BadMessage;
+            }
             break :blk .{ .keep = k };
         },
         .begin => .{ .begin = .{ .txn = try i.int(u64), .kept = try i.int(u64), .point = try i.fixed(32), .at = try i.end(), .blocks = try i.end() } },
@@ -441,6 +482,74 @@ test "every message survives its bytes, a cut or longer one is refused, and only
     try std.testing.expectEqual(@as(?usize, stats_words), (Msg{ .stats = {} }).width());
     try std.testing.expectEqual(@as(?usize, null), (Msg{ .pump = 1 }).width());
     try std.testing.expectEqual(@as(?usize, null), (Msg{ .keep = keep }).width());
+}
+
+test "keep_pictures: a point's pictures and placeholder survive their bytes; a text keep is `keep`, byte for byte; 257 pictures and bad spans are refused" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const media = [_]format.Media{ .{ .start = 3, .len = 4, .digest = @splat(7) }, .{ .start = 100, .len = 64, .digest = @splat(9) } };
+    const keep: Keep = .{ .kept = 7, .at = 128, .point = @splat(3), .group = 2, .shared = false, .lineage = .{ .root = @splat(1) }, .media = &media, .placeholder = 154854 };
+    const k = (try roundTrip(a, .{ .keep = keep })).keep;
+    try std.testing.expectEqual(@as(usize, 2), k.media.len);
+    try std.testing.expect(k.media[0].eql(media[0]) and k.media[1].eql(media[1])); // (the second straddles the cut)
+    try std.testing.expectEqual(@as(u32, 154854), k.placeholder);
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try encode(&list, gpa, .{ .keep = keep });
+    try std.testing.expectEqual(@as(u8, @backingInt(Op.keep_pictures)), list.items[0]);
+    // the same keep without pictures is `keep`, and its bytes are the pictures' prefix
+    var text = keep;
+    text.media = &.{};
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    try encode(&plain, gpa, .{ .keep = text });
+    try std.testing.expectEqual(@as(u8, @backingInt(Op.keep)), plain.items[0]);
+    try std.testing.expectEqualSlices(u8, plain.items[1..], list.items[1..plain.items.len]);
+    try std.testing.expectEqual(plain.items.len + 4 + 2 * 40 + 4, list.items.len);
+    // a `keep` with picture bytes behind it is refused (they are trailing bytes there)
+    list.items[0] = @backingInt(Op.keep);
+    try std.testing.expectError(error.TrailingBytes, decode(a, list.items));
+    list.items[0] = @backingInt(Op.keep_pictures);
+    // bad pictures: none, out of order, overlapping, past the cut, empty, a placeholder above the model's ids
+    const base = plain.items.len;
+    const Bad = struct { fn put(l: []u8, at: usize, v: u32) void {
+        std.mem.writeInt(u32, l[at..][0..4], v, .little);
+    } };
+    const bad = try gpa.dupe(u8, list.items);
+    defer gpa.free(bad);
+    Bad.put(bad, base, 0);
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    @memcpy(bad, list.items);
+    Bad.put(bad, base + 4 + 40, 2); // the second starts before the first
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    @memcpy(bad, list.items);
+    Bad.put(bad, base + 4 + 40, 5); // inside the first (3..7)
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    @memcpy(bad, list.items);
+    Bad.put(bad, base + 4 + 40, 128); // at the cut
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    @memcpy(bad, list.items);
+    Bad.put(bad, base + 4 + 4, 0); // empty
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    @memcpy(bad, list.items);
+    Bad.put(bad, bad.len - 4, format.picture_ids);
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    @memcpy(bad, list.items);
+    Bad.put(bad, base, 1_000_000); // a count past what the bytes hold
+    try std.testing.expectError(error.BadMessage, decode(a, bad));
+    Bad.put(bad, base, 3);
+    try std.testing.expectError(error.ShortMessage, decode(a, bad));
+    // 256 pictures go, 257 do not
+    var many: [max_note_media + 1]format.Media = undefined;
+    for (&many, 0..) |*md, i| md.* = .{ .start = @intCast(i), .len = 1, .digest = @splat(1) };
+    var wide = keep;
+    wide.at = 4096;
+    wide.media = many[0..max_note_media];
+    try std.testing.expectEqual(@as(usize, max_note_media), (try roundTrip(a, .{ .keep = wide })).keep.media.len);
+    wide.media = &many;
+    try std.testing.expectError(error.TooManyPictures, encode(&list, gpa, .{ .keep = wide }));
 }
 
 test "the message layout is the documented one, and bad values are refused" {

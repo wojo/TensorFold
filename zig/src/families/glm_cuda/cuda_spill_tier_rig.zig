@@ -533,16 +533,31 @@ pub const Pair = struct {
         return first;
     }
 
+    /// A pass of the model ids `raw` on both ranks keeping its state at `mark` as a prompt with pictures: the prompt
+    /// cache's write carries the content key `keyed`, every picture's identity `media` and `raw` (Tier.keep's
+    /// images/media/raw). Rank 0's kept state and its point's id (null: not written).
+    pub fn keepPictures(p: *Pair, raw: []const u32, keyed: []const u32, media: []const format.Media, mark: u32, group: u64) !struct { saved: *anyopaque, point: ?u64 } {
+        var w: Writer = .{ .p = p, .group = group, .keyed = keyed, .media = media, .pictures = true };
+        _ = try p.passBoth(raw, &.{mark}, .{ .ptr = &w, .at = Writer.at }, null);
+        return .{ .saved = w.saved orelse return error.TestNothingKept, .point = w.point };
+    }
+
     const Writer = struct {
         p: *Pair,
         group: u64,
         saved: ?*anyopaque = null,
         point: ?u64 = null,
+        keyed: []const u32 = &.{},
+        media: []const format.Media = &.{},
+        pictures: bool = false,
         fn at(ptr: *anyopaque, s: *lanes.Stream, mark: u32) void {
             const w: *Writer = @ptrCast(@alignCast(ptr));
             const saved = w.p.hooks.save(w.p.hooks.ptr, null, mark) catch return;
             w.saved = saved;
-            w.point = w.p.lead0().keep(.{ .saved = saved, .key = s.prompt()[0..mark], .at = mark, .group = w.group });
+            w.point = if (w.pictures)
+                w.p.lead0().keep(.{ .saved = saved, .key = w.keyed[0..mark], .at = mark, .group = w.group, .images = true, .media = w.media, .raw = s.prompt() })
+            else
+                w.p.lead0().keep(.{ .saved = saved, .key = s.prompt()[0..mark], .at = mark, .group = w.group });
         }
     };
 
@@ -598,8 +613,13 @@ pub const Pair = struct {
 
     /// A restore of the longest point `prompt` extends, polled to its end; rank 1 hears every note on the way.
     pub fn restore(p: *Pair, prompt: []const u32) !tier.Poll {
+        return p.restoreMedia(prompt, false, &.{});
+    }
+
+    /// `restore` of a key with pictures (`images`, their identities `media`: Want.images/media).
+    pub fn restoreMedia(p: *Pair, prompt: []const u32, images: bool, media: []const format.Media) !tier.Poll {
         const l = p.lead0();
-        const pt = l.lookup(prompt, 0, @intCast(prompt.len - 1), &.{}, 0) orelse return error.TestNoPoint;
+        const pt = l.lookupMedia(prompt, 0, @intCast(prompt.len - 1), &.{}, 0, images, media) orelse return error.TestNoPoint;
         const job = try l.begin(pt.id, pt.at, pt.shared);
         try p.sink.take(&p.r[1]);
         var i: usize = 0;

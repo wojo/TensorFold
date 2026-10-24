@@ -95,8 +95,8 @@ pub const Limits = struct {
 
 /// A picture inside a point: its prompt positions and the full SHA-256 of its payload (per-position picture keys are
 /// shortened; disk identity takes the whole digest and the span). A picture may run past the point's cut
-/// (`start < at < start + len`). (extern, so a tier can hand over its prompt cache's records as they are; v1.0.7's
-/// prompt cache keeps no pictures, so a tier here passes none.)
+/// (`start < at < start + len`). (extern, so a tier can hand over its prompt cache's records as they are:
+/// core/prompt_media's Media is the same bytes, checked by the GLM tier at comptime.)
 pub const Media = extern struct {
     start: u32,
     len: u32,
@@ -111,7 +111,7 @@ pub const Media = extern struct {
 pub const picture_ids: u32 = 0x8000_0000;
 
 /// Scheme 1's keyed id for position `j` of a picture whose payload's SHA-256 is `digest`. A prompt cache that keys
-/// pictures must make the same ids (DeepSeek's prompt_cache.pictureId does; v1.0.7's keys no pictures).
+/// pictures must make the same ids (core/prompt_media.pictureId does, as DeepSeek's prompt_cache.pictureId).
 pub fn pictureId(digest: *const Digest, j: u32) u32 {
     const seed = std.mem.readInt(u64, digest[0..8], .little);
     return picture_ids | (@as(u32, @truncate(std.hash.Wyhash.hash(seed, std.mem.asBytes(&j)))) & 0x7fff_ffff);

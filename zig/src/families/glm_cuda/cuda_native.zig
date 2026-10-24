@@ -278,7 +278,12 @@ fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choic
 /// Spill v2's settings from the server's (`hold`: the release guard's limit, a quarter of the kept-state budget: held
 /// buffers sit outside it until their blocks are out).
 fn tierSettings(o: Options, budget: u64) spill_tier.Settings {
-    return .{ .dir = o.spill_dir orelse "", .gib = o.spill_gib, .min_free_gib = o.spill_min_free_gib, .min_tokens = o.spill_min_tokens, .quota = o.spill_quota, .turns = o.spill_turns, .read_blocks = o.spill_read_blocks, .stage_mib = o.spill_stage_mib, .hold_bytes = budget / 4 };
+    return .{ .dir = o.spill_dir orelse "", .gib = o.spill_gib, .min_free_gib = o.spill_min_free_gib, .min_tokens = o.spill_min_tokens, .quota = o.spill_quota, .turns = o.spill_turns, .read_blocks = o.spill_read_blocks, .stage_mib = o.spill_stage_mib, .hold_bytes = budget / 4, .image_cache = imageCache() };
+}
+
+/// TF_GLM_IMAGE_CACHE on this rank: on unless exactly "0" (prompt_cache.imageCacheOn's reading; the server's too).
+fn imageCache() bool {
+    return !std.mem.eql(u8, envText("TF_GLM_IMAGE_CACHE") orelse return true, "0");
 }
 
 /// Spill v2's tier on this rank, once the ranks agreed on their identities and on one kept-state budget: this rank's
@@ -320,6 +325,7 @@ fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identi
             side.close();
             return err;
         };
+        own.follower_tier.?.image_cache = s.image_cache;
         own.serving.?.local.spill_side = own.follower_tier.?.spillSide();
     }
 }
@@ -347,7 +353,7 @@ fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Co
         .driver = try ctx.d.version(),
         .state_format = spill_state.format_version,
         .wire = spill_wire.version,
-        .features = try identity.featureString(&fbuf, .{ .spill_min_tokens = o.spill_min_tokens, .kv_shard = kv.on, .drafts = o.drafts, .streams = @intCast(streams), .prefill_rows = @intCast(e.prefill_rows) }),
+        .features = try identity.featureString(&fbuf, .{ .spill_min_tokens = o.spill_min_tokens, .kv_shard = kv.on, .drafts = o.drafts, .streams = @intCast(streams), .prefill_rows = @intCast(e.prefill_rows), .image_cache = imageCache() }),
         .env = env,
     };
     const fp = try identity.build(gpa, io, r);

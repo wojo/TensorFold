@@ -78,6 +78,10 @@ pub const Settings = struct {
     direct: bool = true,
     /// The release guard's limit: released kept states held while their writes still read them (cuda_spill_state.Guard).
     hold_bytes: u64 = 4 << 30,
+    /// Pictures' points kept and found (TF_GLM_IMAGE_CACHE, on unless exactly "0": prompt_cache.imageCacheOn; the
+    /// fingerprint's features carry it when off, so every rank agrees). Off: a prompt with pictures keeps nothing on
+    /// disk and finds nothing there, and a follower skips a picture keep.
+    image_cache: bool = true,
 
     pub fn enabled(s: Settings) bool {
         return s.dir.len > 0 and s.gib > 0;
@@ -178,7 +182,79 @@ pub const Counts = struct {
     dropped_temporaries: u64 = 0,
     points_part0: u64 = 0,
     points_part1: u64 = 0,
+    pictures_kept: u64 = 0,
+    pictures_refused: u64 = 0,
 };
+
+// -- pictures (the server's content keys, recorded with their full digests: core/spill format v3) ----------------------
+
+/// A point's pictures as the store records them: the prompt's pictures that start before the cut (a prefix of them),
+/// and the model id their rows hold (the placeholder, the same for every picture).
+pub const Pictures = struct { media: []const format.Media = &.{}, placeholder: u32 = 0 };
+
+/// The pictures of the point `keyed[0..at]` of a prompt whose pictures are `media` (all of them, in order) and whose
+/// model ids are `raw`: null when the ids do not agree with the media (a picture `media` does not name, ids not made
+/// from its digest, a raw id that is not the placeholder: the point is then not written), or past
+/// wire.max_note_media. A point no picture reaches is a text point (`media` empty).
+pub fn pointPictures(keyed: []const u32, raw: []const u32, media: []const format.Media, at: u32) ?Pictures {
+    if (keyed.len < at or !keyedMedia(keyed[0..at], media)) return null;
+    var n: usize = 0;
+    while (n < media.len and media[n].start < at) n += 1;
+    if (n == 0) return .{};
+    if (n > wire.max_note_media or raw.len < at) return null;
+    const placeholder = raw[media[0].start];
+    if (placeholder >= format.picture_ids) return null;
+    var i: usize = 0;
+    for (media[0..n]) |m| {
+        if (!std.mem.eql(u32, keyed[i..m.start], raw[i..m.start])) return null;
+        const stop = @min(@as(usize, m.start) + m.len, at);
+        for (raw[m.start..stop]) |x| if (x != placeholder) return null;
+        i = stop;
+    }
+    if (!std.mem.eql(u32, keyed[i..at], raw[i..at])) return null;
+    return .{ .media = media[0..n], .placeholder = placeholder };
+}
+
+/// prompt_cache.mediaKeys over the store's media: every picture id of `keyed` named by a span of `media` and made
+/// from its digest, nothing else (spans may run past the ids; those starting past them are not looked at).
+pub fn keyedMedia(keyed: []const u32, media: []const format.Media) bool {
+    var at: usize = 0;
+    var prev_end: u64 = 0;
+    for (media) |m| {
+        if (m.len == 0 or m.start < prev_end) return false;
+        prev_end = @as(u64, m.start) + m.len;
+        if (m.start >= keyed.len) continue;
+        for (keyed[at..m.start]) |id| if (id >= format.picture_ids) return false;
+        const stop: usize = @intCast(@min(prev_end, keyed.len));
+        for (keyed[m.start..stop], 0..) |id, j| if (id != format.pictureId(&m.digest, @intCast(j))) return false;
+        at = stop;
+    }
+    for (keyed[at..]) |id| if (id >= format.picture_ids) return false;
+    return true;
+}
+
+/// A follower's ids for the point rank 0 noted: from its own model ids `own` (its Kept's tokens), each noted
+/// picture's rows keyed by its digest (format.pictureId) and their raw id the noted placeholder. False when this
+/// rank's ids are not rank 0's prompt: a noted picture's row that does not hold the placeholder here, or a
+/// placeholder outside every noted picture before `at` (a picture this rank has elsewhere).
+pub fn followerIds(own: []const u32, at: u32, media: []const format.Media, placeholder: u32, keyed: []u32, raw: []u32) bool {
+    if (own.len < at or keyed.len != at or raw.len != at) return false;
+    var mi: usize = 0;
+    for (own[0..at], 0..) |q, i| {
+        while (mi < media.len and i >= @as(u64, media[mi].start) + media[mi].len) mi += 1;
+        const in = mi < media.len and i >= media[mi].start;
+        if (q >= format.picture_ids) return false;
+        if (in) {
+            if (q != placeholder) return false;
+            keyed[i] = format.pictureId(&media[mi].digest, @intCast(i - media[mi].start));
+        } else {
+            if (q == placeholder) return false;
+            keyed[i] = q;
+        }
+        raw[i] = q;
+    }
+    return true;
+}
 
 fn monotonicNs() u64 {
     var ts: std.c.timespec = undefined;
@@ -307,6 +383,9 @@ pub fn Side(comptime E: type) type {
             origin: ?format.Origin = null,
             shared: bool = false,
             group: u64 = 0,
+            /// with pictures before `at`: the prompt's model ids [0, at) and the pictures (a point's media, in order)
+            raw: ?[]const u32 = null,
+            media: []const format.Media = &.{},
         };
         pub const Kept = enum { queued, stored, refused };
 
@@ -326,6 +405,10 @@ pub fn Side(comptime E: type) type {
         guard: Guard,
         cached: Counts = .{},
         cancelled_shutdown: u64 = 0,
+        /// this rank's points written with pictures before their cut, and keeps and lookups with pictures turned away
+        /// (ids and media disagree, image cache off): its counters' pictures_kept / pictures_refused
+        pictures_kept: u64 = 0,
+        pictures_refused: u64 = 0,
 
         /// Opens this rank's store under `s.dir` (namespace `prefix` + `compat`) over `staging` (pinned, at least
         /// plan's bytes, 4 KiB aligned; the caller's), its events made by the engine (eventCount). `layout`: the
@@ -433,7 +516,7 @@ pub fn Side(comptime E: type) type {
             if (self.writes.contains(k.snap.id)) return .stored;
             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
             self.copies.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
-            const r = self.store.keep(.{ .keyed = k.keyed, .lineage = lin, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytesOf(at, own), .source = st.sourceOf(k.snap.id) });
+            const r = self.store.keep(.{ .keyed = k.keyed, .raw = if (k.media.len > 0) k.raw else null, .media = k.media, .lineage = lin, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytesOf(at, own), .source = st.sourceOf(k.snap.id) });
             const q = switch (r) {
                 .queued => |q| q,
                 .stored => return .stored,
@@ -885,6 +968,8 @@ pub fn Side(comptime E: type) type {
                 .quota_trims = c.quota_trims,
                 .recovered_points = c.recovered_points,
                 .dropped_temporaries = c.temps_removed + c.recovered_dropped,
+                .pictures_kept = self.pictures_kept,
+                .pictures_refused = self.pictures_refused,
             };
             if (self.layout.owner == .owner_sharded) { // (two parts: this rank's own and the other's)
                 const own = self.layout.g.rank;
@@ -922,6 +1007,10 @@ pub fn Leader(comptime E: type) type {
             parent: ?u64 = null,
             fork: u32 = 0,
             lineage: []const Fork = &.{},
+            /// its key holds pictures' ids: every picture's identity and the prompt's model ids (prompt_cache.Write's)
+            images: bool = false,
+            media: []const format.Media = &.{},
+            raw: []const u32 = &.{},
         };
 
         gpa: Allocator,
@@ -948,11 +1037,12 @@ pub fn Leader(comptime E: type) type {
         pump_at: u64 = 0,
         presence_refused: u64 = 0,
         misses: u64 = 0,
+        image_cache: bool = true, // Settings.image_cache: pictures' points kept and found
 
         /// `side` is moved in (closed by destroy). `boot` salts this process's lineage names.
         pub fn create(gpa: Allocator, side: *S, lanes: *L, s: Settings, boot: [16]u8) !*Self {
             const self = try gpa.create(Self);
-            self.* = .{ .gpa = gpa, .side = side, .lanes = lanes, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, side.plan.restore))), .boot = boot };
+            self.* = .{ .gpa = gpa, .side = side, .lanes = lanes, .min_tokens = s.min_tokens, .max_restores = @intCast(@max(1, @min(s.restores, side.plan.restore))), .boot = boot, .image_cache = s.image_cache };
             return self;
         }
 
@@ -1035,9 +1125,21 @@ pub fn Leader(comptime E: type) type {
         /// any): rank 0's own index, no disk I/O. A longer point off the starts is passed over for the longest start
         /// under it, and the index asked again there.
         pub fn lookup(self: *Self, key: []const u32, beyond: u32, max_at: u32, starts: []const u32, lookahead: u32) ?Point {
+            return self.lookupMedia(key, beyond, max_at, starts, lookahead, false, &.{});
+        }
+
+        /// `lookup` for a key with pictures (`images`, their identities `media`): every picture of the key accounted
+        /// for by its full identity, or no point at all (pictures_refused); the store then matches each point's
+        /// pictures before its cut by span and digest.
+        pub fn lookupMedia(self: *Self, key: []const u32, beyond: u32, max_at: u32, starts: []const u32, lookahead: u32, images: bool, media: []const format.Media) ?Point {
+            if (images or media.len > 0) if (!self.image_cache or !keyedMedia(key, media)) {
+                self.side.pictures_refused += 1;
+                self.misses += 1;
+                return null;
+            };
             var top = max_at;
             const found = while (top > beyond) {
-                const h = self.side.store.lookup(.{ .keyed = key, .longer_than = beyond, .max_at = top, .grid = st.grid }) orelse break null;
+                const h = self.side.store.lookup(.{ .keyed = key, .media = media, .longer_than = beyond, .max_at = top, .grid = st.grid }) orelse break null;
                 if (starts.len == 0 or std.mem.indexOfScalar(u32, starts, h.at) != null) break h;
                 top = startBelow(starts, h.at);
             } else null;
@@ -1059,6 +1161,20 @@ pub fn Leader(comptime E: type) type {
             if (at == 0 or at % st.grid != 0 or at < self.min_tokens or w.key.len < at) return null;
             const kp: *L.Kept = @ptrCast(@alignCast(w.saved));
             if (kp.at != at) return null;
+            // pictures: recorded with their spans and full digests (those before the cut), the keyed ids checked to
+            // derive from them and the prompt's model ids kept beside them; any disagreement keeps nothing on disk
+            // (a cut before every picture is a text point, written with the image cache off too)
+            var pics: Pictures = .{};
+            if (w.images or w.media.len > 0) {
+                pics = pointPictures(w.key, w.raw, w.media, at) orelse {
+                    self.side.pictures_refused += 1;
+                    return null;
+                };
+                if (pics.media.len > 0 and !self.image_cache) {
+                    self.side.pictures_refused += 1;
+                    return null;
+                }
+            }
             var forks: std.ArrayList(format.Fork) = .empty;
             defer forks.deinit(self.gpa);
             // (owner-sharded: salted with the state's home, which every rank's keep note then carries)
@@ -1066,15 +1182,17 @@ pub fn Leader(comptime E: type) type {
             if (lin.forks.len > wire.max_forks) return null; // (a keep note carries no more: no rank holds a point another lacks)
             const origin: ?format.Origin = if (w.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = w.fork } else null) else null;
             const keyed = w.key[0..at];
-            const key = format.pointKey(keyed, @intCast(st.block_tokens), &.{});
+            const key = format.pointKey(keyed, @intCast(st.block_tokens), pics.media);
+            const raw: ?[]const u32 = if (pics.media.len > 0) w.raw[0..at] else null;
             // (room first: once the write is queued nothing may fail, or the cache, holding no point, never releases
             // the state the write reads)
             self.points.ensureUnusedCapacity(self.gpa, 1) catch return null;
-            if (self.side.keepPoint(.{ .keyed = keyed, .key = key, .snap = kp.snap, .lineage = lin, .origin = origin, .shared = w.shared, .group = w.group }) == .refused) return null;
+            if (self.side.keepPoint(.{ .keyed = keyed, .key = key, .snap = kp.snap, .lineage = lin, .origin = origin, .shared = w.shared, .group = w.group, .raw = raw, .media = pics.media }) == .refused) return null;
+            if (pics.media.len > 0) self.side.pictures_kept += 1;
             const id = pointId(key);
             self.points.putAssumeCapacity(id, .{ .key = key, .at = at });
             if (self.paired()) {
-                self.note(.{ .keep = .{ .kept = kp.key, .at = at, .point = key, .group = w.group, .shared = w.shared, .lineage = lin, .origin = origin } }, false) catch {};
+                self.note(.{ .keep = .{ .kept = kp.key, .at = at, .point = key, .group = w.group, .shared = w.shared, .lineage = lin, .origin = origin, .media = pics.media, .placeholder = pics.placeholder } }, false) catch {};
                 self.peer_writes = true;
             }
             return id;
@@ -1337,6 +1455,8 @@ pub fn Leader(comptime E: type) type {
             var c = self.side.cached;
             c.presence_refused = self.presence_refused;
             c.compatible_misses = self.misses;
+            c.pictures_kept = self.side.pictures_kept;
+            c.pictures_refused = self.side.pictures_refused;
             out[0] = c;
             const n = @min(self.peers_n, out.len - 1);
             @memcpy(out[1..][0..n], self.peers[0..n]);
@@ -1362,6 +1482,11 @@ pub fn Follower(comptime E: type) type {
         lanes: *L,
         restores: std.AutoHashMapUnmanaged(u64, Fx) = .empty, // by transaction
         skipped: u64 = 0, // keeps this rank wrote no copy of (its ids or state not rank 0's, or its store refused)
+        /// Settings.image_cache on this rank (set after create; the fingerprints agreed, so rank 0's): off, a keep with
+        /// pictures is skipped
+        image_cache: bool = true,
+        keyed: std.ArrayList(u32) = .empty, // a picture keep's ids rebuilt from this rank's own (followerIds)
+        raw: std.ArrayList(u32) = .empty,
 
         /// `side` is moved in (closed by destroy).
         pub fn create(gpa: Allocator, side: *S, lanes: *L) !*Self {
@@ -1377,6 +1502,8 @@ pub fn Follower(comptime E: type) type {
                 self.lanes.unreserve(fx.dest);
             }
             self.restores.deinit(self.gpa);
+            self.keyed.deinit(self.gpa);
+            self.raw.deinit(self.gpa);
             self.side.close();
             self.gpa.destroy(self);
         }
@@ -1399,11 +1526,29 @@ pub fn Follower(comptime E: type) type {
                     // this rank's own ids must name rank 0's point, and (owner-sharded) its state the home rank 0's lineage
                     // is salted with, or a restore could never agree on it
                     const home = side.e.tierKept(kp.snap).home;
-                    if (kp.at != k.at or kp.tokens.len < k.at or !std.mem.eql(u8, &format.pointKey(kp.tokens[0..k.at], @intCast(st.block_tokens), &.{}), &k.point) or k.lineage.part != if (home) |h| @as(?u32, h) else null) {
+                    if (kp.at != k.at or kp.tokens.len < k.at or k.lineage.part != if (home) |h| @as(?u32, h) else null) {
                         self.skipped += 1;
                         return;
                     }
-                    if (side.keepPoint(.{ .keyed = kp.tokens[0..k.at], .key = k.point, .snap = kp.snap, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group }) == .refused) self.skipped += 1;
+                    // pictures: rank 0's keyed and raw ids rebuilt from this rank's own model ids and the noted pictures
+                    var keyed: []const u32 = kp.tokens[0..k.at];
+                    var raw: ?[]const u32 = null;
+                    if (k.media.len > 0) {
+                        if (!self.image_cache) return self.skipPictures();
+                        self.keyed.resize(self.gpa, k.at) catch return self.skipPictures();
+                        self.raw.resize(self.gpa, k.at) catch return self.skipPictures();
+                        if (!followerIds(kp.tokens, k.at, k.media, k.placeholder, self.keyed.items, self.raw.items)) return self.skipPictures();
+                        keyed = self.keyed.items;
+                        raw = self.raw.items;
+                    }
+                    if (!std.mem.eql(u8, &format.pointKey(keyed, @intCast(st.block_tokens), k.media), &k.point)) {
+                        if (k.media.len > 0) return self.skipPictures();
+                        self.skipped += 1;
+                        return;
+                    }
+                    if (side.keepPoint(.{ .keyed = keyed, .key = k.point, .snap = kp.snap, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .raw = raw, .media = k.media }) == .refused) {
+                        self.skipped += 1;
+                    } else if (k.media.len > 0) side.pictures_kept += 1;
                 },
                 .begin => |b| try self.begin(b),
                 .progress => |p| {
@@ -1427,6 +1572,12 @@ pub fn Follower(comptime E: type) type {
                 .flush => |ns| _ = side.flush(monotonicNs() +| ns),
                 .has, .validate, .stats => return error.AskAsNote,
             }
+        }
+
+        /// A keep with pictures this rank turned away: skipped, and counted as rank 0 counts its refusals.
+        fn skipPictures(self: *Self) void {
+            self.skipped += 1;
+            self.side.pictures_refused += 1;
         }
 
         /// Rank 0's restore here: the destination's wrapper under rank 0's key, this rank's reads, its destination.
@@ -1536,8 +1687,15 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
             @compileError("prompt_cache.Fork and the tier's Fork differ");
         for (@typeInfo(pc.TierCounts).@"struct".field_names) |n| if (!@hasField(Counts, n)) @compileError("the tier's Counts lack prompt_cache.TierCounts." ++ n);
         for (@typeInfo(Counts).@"struct".field_names) |n| if (!@hasField(pc.TierCounts, n)) @compileError("prompt_cache.TierCounts lacks the tier's " ++ n);
+        // the prompt cache's media are the store's, byte for byte (Want.media and Write.media go to the store as they are)
+        if (@sizeOf(pc.Media) != @sizeOf(format.Media) or @alignOf(pc.Media) != @alignOf(format.Media) or @offsetOf(pc.Media, "start") != @offsetOf(format.Media, "start") or @offsetOf(pc.Media, "len") != @offsetOf(format.Media, "len") or @offsetOf(pc.Media, "digest") != @offsetOf(format.Media, "digest") or pc.picture_ids != format.picture_ids)
+            @compileError("prompt_cache.Media and core/spill's format.Media differ");
     }
     return struct {
+        fn asFormat(m: []const pc.Media) []const format.Media {
+            return @ptrCast(m);
+        }
+
         pub const vtable: pc.Tier.VTable = .{
             .lookup = lookupFn,
             .begin = beginFn,
@@ -1565,7 +1723,7 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
         }
 
         fn lookupFn(ptr: *anyopaque, want: *const pc.Want) ?pc.Point {
-            const p = of(ptr).lookup(want.key, want.beyond, want.max_at, want.starts, want.lookahead) orelse return null;
+            const p = of(ptr).lookupMedia(want.key, want.beyond, want.max_at, want.starts, want.lookahead, want.images, asFormat(want.media)) orelse return null;
             return .{ .id = p.id, .at = p.at, .tokens = p.tokens, .group = p.group, .shared = p.shared };
         }
         fn beginFn(ptr: *anyopaque, point: *const pc.Point) anyerror!u64 {
@@ -1588,7 +1746,7 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
             of(ptr).cancel(job);
         }
         fn keepFn(ptr: *anyopaque, w: *const pc.Write) ?u64 {
-            return of(ptr).keep(.{ .saved = w.saved, .key = w.key, .at = w.at, .group = w.group, .shared = w.shared, .parent = w.parent, .fork = w.fork, .lineage = @ptrCast(w.lineage) });
+            return of(ptr).keep(.{ .saved = w.saved, .key = w.key, .at = w.at, .group = w.group, .shared = w.shared, .parent = w.parent, .fork = w.fork, .lineage = @ptrCast(w.lineage), .images = w.images, .media = asFormat(w.media), .raw = w.raw });
         }
         fn releaseFn(ptr: *anyopaque, _: u64, saved: pc.Saved) void {
             of(ptr).release(saved);
@@ -1625,4 +1783,5 @@ pub fn TierOf(comptime Lead: type, comptime pc: type) type {
 
 test {
     _ = @import("cuda_spill_tier_test.zig");
+    _ = @import("cuda_spill_tier_pictures_test.zig");
 }

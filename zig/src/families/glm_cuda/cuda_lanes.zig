@@ -2435,6 +2435,131 @@ test "TF_GLM_KV_SHARD: a fresh prompt fills with borrowed rows on both ranks, he
     try std.testing.expectEqual(@as(usize, 0), e0.pool.?.extents.items.len);
 }
 
+test "TF_GLM_KV_SHARD with pictures: a fresh picture prompt borrows the other part's rows on both ranks with its pictures in every segment; its kept state carries when its home is full, the tower only past the cut" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    const B = Lanes(MiniEngine);
+    var e0: MiniEngine = .{ .gpa = gpa, .spill_on = true, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
+    defer e0.deinit();
+    var e1: MiniEngine = .{ .gpa = gpa, .spill_on = true, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
+    defer e1.deinit();
+    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+    defer r0.deinit();
+    var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
+    defer r1.deinit();
+    r1.follower = true;
+    var sink: NoteSink = .{ .gpa = gpa };
+    defer sink.deinit();
+    r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+    const hooks = r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var big: [2200]u32 = undefined;
+    for (&big, 0..) |*t, i| t.* = @intCast(i * 13 % 997);
+    const px: [3 * 28 * 84]u8 = @splat(5);
+    const items = [_]lanes.MediaItem{ .{ .h = 28, .w = 84, .data = &px }, .{ .h = 28, .w = 84, .data = &px } };
+    const rows = [_]u32{ 100, 101, 102, 2150, 2151, 2152 };
+    for (rows) |r| big[r] = 99;
+    const media: lanes.Media = .{ .rows = &rows, .items = &items };
+    const follower_media: lanes.Media = .{ .rows = &.{}, .follower_rows = rows.len }; // (rank 1's copy: the count only)
+    // 1. the fresh pass (marks 64 and 2,112) borrows part 1's rows on both ranks, pictures attached throughout
+    var adopter: Adopter = .{ .hooks = hooks };
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &big, .max_new = 4, .media = &media, .reuse = .{ .marks = &.{ 64, 2112 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    var s1b = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &big, .max_new = 4, .media = &follower_media, .reuse = .{ .marks = &.{ 64, 2112 } } });
+    defer s1b.deinit(gpa);
+    try B.prefillFn(&r0, &s1);
+    try B.prefillFn(&r1, &s1b);
+    try std.testing.expectEqual(@as(usize, 3), e0.lent_fills);
+    try std.testing.expectEqual(@as(usize, 3), e1.lent_fills);
+    for ([_]*MiniEngine{ &e0, &e1 }) |e| {
+        try std.testing.expectEqual(@as(usize, 1), e.media_attaches);
+        try std.testing.expectEqual(@as(usize, 3), e.media_calls.items.len);
+        for (e.media_calls.items) |c| try std.testing.expect(c.attached);
+        try std.testing.expect(e.media_attached == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), e0.pool.?.rowsIn(1).twins + e1.pool.?.rowsIn(1).twins);
+    try sink.take(&r1);
+    const k2112 = adopter.saved[1];
+    try std.testing.expectEqual(@as(?usize, 0), r0.keptOf(k2112).?.snap.home);
+    // 2. part 0 full (s1 and another): a resume of the 2,112-token state stays in part 1 with its rows carried; the
+    // tower runs only for the second picture (the first is wholly in the state)
+    const fill0 = (try e0.pool.?.placeIn(4096, null, 0)).?;
+    const fill1 = (try e1.pool.?.placeIn(4096, null, 0)).?;
+    const o0 = try e0.pool.?.add(fill0, 4096);
+    const o1 = try e1.pool.?.add(fill1, 4096);
+    e0.media_calls.clearRetainingCapacity();
+    e1.media_calls.clearRetainingCapacity();
+    var s2 = try lanes.Stream.init(gpa, .{ .id = "r", .prompt = &big, .max_new = 4, .media = &media, .reuse = .{ .saved = k2112, .at = 2112 } });
+    defer s2.deinit(gpa);
+    var s2b = try lanes.Stream.init(gpa, .{ .id = "r", .prompt = &big, .max_new = 4, .media = &follower_media, .reuse = .{ .saved = r1.savedFor(r0.keptOf(k2112).?.key), .at = 2112 } });
+    defer s2b.deinit(gpa);
+    try B.prefillFn(&r0, &s2);
+    try B.prefillFn(&r1, &s2b);
+    try sink.take(&r1);
+    try std.testing.expectEqual(@as(usize, 1), e0.carries);
+    try std.testing.expectEqual(@as(usize, 1), e1.carries);
+    try std.testing.expect(s2.cached == 2112 and !s2.reuse_failed);
+    try std.testing.expectEqual(@as(usize, 1), e0.media_calls.items[0].from_item);
+    try std.testing.expectEqual(MiniEngine.hash(&big), try firstToken(B, &r0, &s2));
+    try std.testing.expectEqual(e0.pool.?.digest(), e1.pool.?.digest());
+    B.releaseFn(&r0, &s1);
+    B.releaseFn(&r1, &s1b);
+    B.releaseFn(&r0, &s2);
+    B.releaseFn(&r1, &s2b);
+    try e0.pool.?.remove(o0);
+    try e1.pool.?.remove(o1);
+}
+
+test "TF_GLM_KV_SHARD (SH-1): rank 0 refuses a picture prompt (no tower) before its sequence, rank 1 drops the one it opened; the next placements and digests still check" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    const B = Lanes(MiniEngine);
+    var e0: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1, .vision = false };
+    defer e0.deinit();
+    var e1: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
+    defer e1.deinit();
+    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+    defer r0.deinit();
+    var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
+    defer r1.deinit();
+    r1.follower = true;
+    var sink: NoteSink = .{ .gpa = gpa };
+    defer sink.deinit();
+    r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+    var gate: TestGate = .{ .other = &.{ true, false, true, true, true, true } };
+    r0.gate = .{ .ptr = &gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
+    r1.gate = .{ .ptr = &gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
+    var prompt = testPrompt(7);
+    const px: [3 * 28 * 84]u8 = @splat(5);
+    const items = [_]lanes.MediaItem{.{ .h = 28, .w = 84, .data = &px }};
+    const rows = [_]u32{ 10, 11, 12 };
+    for (rows) |r| prompt[r] = 99;
+    const media: lanes.Media = .{ .rows = &rows, .items = &items };
+    const follower_media: lanes.Media = .{ .rows = &.{}, .follower_rows = rows.len };
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &media });
+    defer s1.deinit(gpa);
+    var s1b = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4, .media = &follower_media });
+    defer s1b.deinit(gpa);
+    try std.testing.expectError(error.NoVisionTower, B.prefillFn(&r0, &s1));
+    try std.testing.expectError(error.OtherRankFailed, B.prefillFn(&r1, &s1b));
+    try std.testing.expectEqual(@as(u64, 0), e0.pool.?.next_id); // (refused before newSeq)
+    try std.testing.expectEqual(@as(u64, 1), e1.pool.?.next_id);
+    try std.testing.expect(!e0.media_reserved and !e1.media_reserved);
+    // the next prompts (text): the same extents at the same bases on both ranks, under other ids; each note checks
+    var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = prompt[0..50], .max_new = 4 });
+    defer s2.deinit(gpa);
+    var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = prompt[0..50], .max_new = 4 });
+    defer s3.deinit(gpa);
+    for ([_]*lanes.Stream{ &s2, &s3 }) |s| {
+        try B.prefillFn(&r0, s);
+        try B.prefillFn(&r1, s);
+        try std.testing.expectEqual(@as(usize, 1), sink.notes.items.len);
+        try sink.take(&r1);
+    }
+    r0.round = 1;
+    r0.layoutNote();
+    try sink.take(&r1);
+}
+
 fn firstToken(comptime B: type, r: *B, s: *lanes.Stream) !u32 {
     return B.readFn(r, try B.firstFn(r, s, s.prompt_len));
 }
