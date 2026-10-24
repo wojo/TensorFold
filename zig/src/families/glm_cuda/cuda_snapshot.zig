@@ -10,6 +10,9 @@
 //!   rec      the 34 KDA layers' recurrent states, the parity each layer's chunk wrote last
 //!   conv     the 34 layers' conv windows
 //!   draft    DFlash2's per-slot K and V rings (5 layers), whole, when a drafter runs
+//!   mtp      MTP drafts (`withMtp`): the head's one DSA plane one row short, latent rows [0, at - 1) and their pools,
+//!            its two index rings whole (sized from the head's own ring), and the target's normed hidden row at - 1
+//!            (the tail: the head absorbs one row behind the target, cuda_mtp_keep.zig)
 //! Nothing else carries over a chunk boundary: the HC streams, the router, the selections are chunk-local, and
 //! `pos_dev` is written by every chunk. Pure arithmetic and copies: tests run on host memory standing in for the
 //! device (`Copier`).
@@ -57,6 +60,10 @@ pub const Sections = struct {
     total: usize,
     /// whether the buffer holds the latent rows (TF_GLM_KV_SHARD: on the rank that owned the stream's extent only)
     rows: bool = true,
+    /// MTP drafts (`withMtp`): the head's section at `mtp`, its rows (at - 1) and ring; null: no head section
+    mtp_rows: ?usize = null,
+    mtp_ring: usize = 0,
+    mtp: usize = 0,
 
     /// A latent plane's rows of the state (the latent section holds 11 of them when `rows`).
     pub fn latentBytes(s: Sections) usize {
@@ -68,7 +75,60 @@ pub const Sections = struct {
     pub fn ringBytes(s: Sections) usize {
         return s.ring * 128 * 2;
     }
+    /// DFlash2's section (0 without a drafter): it ends where the head's begins, or at the end.
+    pub fn draftBytes(s: Sections) usize {
+        return (if (s.mtp_rows != null) s.mtp else s.total) - s.draft;
+    }
+    pub fn mtpLatentBytes(s: Sections) usize {
+        return (s.mtp_rows orelse 0) * G.latent_row;
+    }
+    /// The head's complete pools and the row of the one still filling (as `pooledBytes`; its tokens are in the rings).
+    pub fn mtpPooledBytes(s: Sections) usize {
+        return if (s.mtp_rows) |m| (m / 4 + 1) * G.pool_row else 0;
+    }
+    pub fn mtpRingBytes(s: Sections) usize {
+        return s.mtp_ring * 128 * 2;
+    }
+    /// Offsets in the head's section: latent, pooled, keys, gates, tail.
+    pub fn mtpParts(s: Sections) [5]usize {
+        var o: [5]usize = undefined;
+        var off = s.mtp;
+        for ([_]usize{ s.mtpLatentBytes(), s.mtpPooledBytes(), s.mtpRingBytes(), s.mtpRingBytes(), mtp_tail_bytes }, 0..) |n, i| {
+            o[i] = off;
+            off += std.mem.alignForward(usize, n, 256);
+        }
+        return o;
+    }
 };
+
+/// The target's normed hidden row the head absorbs next (4096 bf16).
+pub const mtp_tail_bytes: usize = 8192;
+
+/// The MTP head's live plane (cuda_mtp.Head: one DSA layer's latent rows, pools and index rings) and its pending row.
+pub const MtpPlane = struct { latent: u64, pooled: u64, keys: u64, gates: u64, ring: usize, pending: u64 };
+
+/// `s` with the MTP head's section after the others: its plane one row short of `s.at` (cuda_mtp_keep), `ring` the
+/// head's own index ring (Caches.initMtp; it need not be the target's).
+pub fn withMtp(s: Sections, ring: usize) Sections {
+    var t = s;
+    t.mtp_rows = s.at -| 1;
+    t.mtp_ring = ring;
+    t.mtp = s.total;
+    var end = t.mtp;
+    for ([_]usize{ t.mtpLatentBytes(), t.mtpPooledBytes(), t.mtpRingBytes(), t.mtpRingBytes(), mtp_tail_bytes }) |n| end += std.mem.alignForward(usize, n, 256);
+    t.total = end;
+    return t;
+}
+
+/// The head's plane and pending row into `buf`'s MTP section (out) or back from it.
+pub fn mtpCopy(c: Copier, s: Sections, buf: u64, m: MtpPlane, out: bool) !void {
+    if (s.mtp_rows == null) return error.NoMtpSection;
+    if (m.ring != s.mtp_ring) return error.MtpRingMismatch;
+    const o = s.mtpParts();
+    const live = [_]u64{ m.latent, m.pooled, m.keys, m.gates, m.pending };
+    const n = [_]usize{ s.mtpLatentBytes(), s.mtpPooledBytes(), s.mtpRingBytes(), s.mtpRingBytes(), mtp_tail_bytes };
+    for (live, o, n) |l, off, bytes| if (out) try c.go(buf + off, l, bytes) else try c.go(l, buf + off, bytes);
+}
 
 pub fn recLayerBytes(g: G) usize {
     return g.lin_heads * 128 * 128 * 4;
@@ -360,4 +420,85 @@ test "section sizes follow the geometry and stay 256-aligned" {
     const t = sections(g, 8192, 2112, 22 << 20);
     try std.testing.expectEqual(t.pooled - t.latent, 2 * (s.pooled - s.latent));
     try std.testing.expect(t.total > s.total);
+}
+
+test "MTP drafts: the head's section sits after the others, one row short of the state, its own ring, 256-aligned" {
+    const g = try G.init(2, 0);
+    const s = sections(g, 4096, 2112, 22 << 20);
+    try std.testing.expectEqual(@as(?usize, null), s.mtp_rows);
+    try std.testing.expectEqual(@as(usize, 22 << 20), s.draftBytes());
+    const t = withMtp(s, 2048 + 64);
+    try std.testing.expectEqual(@as(?usize, 4095), t.mtp_rows);
+    try std.testing.expectEqual(s.total, t.mtp);
+    try std.testing.expectEqual(s.draftBytes(), t.draftBytes());
+    // the target's sections are untouched
+    try std.testing.expectEqual(s.conv, t.conv);
+    try std.testing.expectEqual(s.draft, t.draft);
+    try std.testing.expectEqual(@as(usize, 4095 * G.latent_row), t.mtpLatentBytes());
+    // 1023 complete pools and the one row of the pool still filling (its 3 tokens are in the rings)
+    try std.testing.expectEqual(@as(usize, 1024 * G.pool_row), t.mtpPooledBytes());
+    try std.testing.expectEqual(@as(usize, 2112 * 256), t.mtpRingBytes());
+    const o = t.mtpParts();
+    for (o) |x| try std.testing.expectEqual(@as(usize, 0), x % 256);
+    try std.testing.expectEqual(t.total, o[4] + std.mem.alignForward(usize, mtp_tail_bytes, 256));
+    try std.testing.expectEqual(@as(usize, 0), t.total % 256);
+    // a head ring other than the target's sizes the head's rings, not the target's
+    const u = withMtp(s, 64);
+    try std.testing.expectEqual(t.total - 2 * (2112 - 64) * 256, u.total);
+    // no drafter: the DFlash2 section stays empty with the head's after it
+    const v = withMtp(sections(g, 64, 2112, 0), 2112);
+    try std.testing.expectEqual(@as(usize, 0), v.draftBytes());
+    try std.testing.expectEqual(@as(?usize, 63), v.mtp_rows);
+    try std.testing.expectEqual(@as(usize, 16 * G.pool_row), v.mtpPooledBytes());
+    // a state at 0 (the budget's fixed size) has no head rows
+    try std.testing.expectEqual(@as(?usize, 0), withMtp(sections(g, 0, 2112, 0), 2112).mtp_rows);
+}
+
+test "MTP drafts: the head's plane and pending row round-trip through the section, nothing past its rows" {
+    const gpa = std.testing.allocator;
+    const cap = 256;
+    const ring = 64;
+    const Plane = struct {
+        latent: []u8,
+        pooled: []u8,
+        keys: []u8,
+        gates: []u8,
+        pending: []u8,
+        fn init(a: std.mem.Allocator, seed: u8) !@This() {
+            const p: @This() = .{ .latent = try a.alloc(u8, cap * G.latent_row), .pooled = try a.alloc(u8, (cap / 4 + 2) * G.pool_row), .keys = try a.alloc(u8, ring * 256), .gates = try a.alloc(u8, ring * 256), .pending = try a.alloc(u8, mtp_tail_bytes) };
+            var prng = std.Random.DefaultPrng.init(seed);
+            for ([_][]u8{ p.latent, p.pooled, p.keys, p.gates, p.pending }) |b| prng.random().bytes(b);
+            return p;
+        }
+        fn deinit(p: *@This(), a: std.mem.Allocator) void {
+            for ([_][]u8{ p.latent, p.pooled, p.keys, p.gates, p.pending }) |b| a.free(b);
+        }
+        fn view(p: *const @This()) MtpPlane {
+            return .{ .latent = @intFromPtr(p.latent.ptr), .pooled = @intFromPtr(p.pooled.ptr), .keys = @intFromPtr(p.keys.ptr), .gates = @intFromPtr(p.gates.ptr), .ring = ring, .pending = @intFromPtr(p.pending.ptr) };
+        }
+    };
+    var a = try Plane.init(gpa, 5);
+    defer a.deinit(gpa);
+    var b = try Plane.init(gpa, 6);
+    defer b.deinit(gpa);
+    const g = try G.init(2, 0);
+    const s = withMtp(sections(g, 128, 64, 0), ring);
+    const buf = try gpa.alloc(u8, s.total);
+    defer gpa.free(buf);
+    const c = HostCopy.copier();
+    try mtpCopy(c, s, @intFromPtr(buf.ptr), a.view(), true);
+    const after = try gpa.dupe(u8, b.latent[127 * G.latent_row ..]);
+    defer gpa.free(after);
+    try mtpCopy(c, s, @intFromPtr(buf.ptr), b.view(), false);
+    try std.testing.expectEqualSlices(u8, a.latent[0 .. 127 * G.latent_row], b.latent[0 .. 127 * G.latent_row]);
+    try std.testing.expectEqualSlices(u8, after, b.latent[127 * G.latent_row ..]);
+    try std.testing.expectEqualSlices(u8, a.pooled[0 .. 32 * G.pool_row], b.pooled[0 .. 32 * G.pool_row]);
+    try std.testing.expectEqualSlices(u8, a.keys, b.keys);
+    try std.testing.expectEqualSlices(u8, a.gates, b.gates);
+    try std.testing.expectEqualSlices(u8, a.pending, b.pending);
+    // no head section, or another ring: refused before any copy
+    try std.testing.expectError(error.NoMtpSection, mtpCopy(c, sections(g, 128, 64, 0), @intFromPtr(buf.ptr), b.view(), false));
+    var other = b.view();
+    other.ring = 128;
+    try std.testing.expectError(error.MtpRingMismatch, mtpCopy(c, s, @intFromPtr(buf.ptr), other, false));
 }

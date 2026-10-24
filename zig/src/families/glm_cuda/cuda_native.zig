@@ -218,7 +218,7 @@ pub fn refusal(err: anyerror) ?[]const u8 {
     return shard.why(err) orelse identity.why(err) orelse switch (err) {
         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
-        error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: the prompt cache is off with MTP drafts, so spill v2 would keep nothing (DFlash2 drafts or none)",
+        error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: spill v2 does not store the MTP head's state yet (MTP drafts keep prompt states in memory only; DFlash2 drafts or none)",
         error.SpillV2NoPromptCache => "TF_GLM_SPILL_V2=1 needs the prompt cache, and a rank's kept-state budget is 0 (--prompt-cache-gib; with PROMPT_CACHE_GIB a lower KV_POOL_GIB)",
         error.SpillV2StoreFailed => "TF_GLM_SPILL_V2=1: a rank's spill v2 store did not open (that rank's log says why)",
         error.StagingTooSmall => "TF_GLM_SPILL_STAGE_MIB: spill v2's write ring holds two blocks at least (25 MiB), TF_GLM_SPILL_READ_BLOCKS one",
@@ -239,7 +239,7 @@ fn spillV2(o: Options, choice: choice_mod.Choice) anyerror!?identity.Env {
 
 /// Spill v2 once the ranks agreed on it (its switch and knobs are in the settings text, so every rank answers alike):
 /// this rank's own read error, a world it does not run on yet (the recipe's two ranks; the identity agreement and the
-/// rank protocol are the pair's), MTP drafts (the prompt cache is off with them), or a staging too small for its
+/// rank protocol are the pair's), MTP drafts (its blocks have no MTP head plane yet), or a staging too small for its
 /// blocks. With TF_GLM_KV_SHARD=1 the tier is owner-sharded (Engine.spillLayout).
 fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choice) !?identity.Env {
     const env = (try read) orelse return null;
@@ -389,6 +389,10 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
         if (o.rank == 0) std.log.warn("spill: off with TF_GLM_KV_SHARD=1 (v1 does not record the part a stored state's latent rows lie in; TF_GLM_SPILL_V2=1 does)", .{});
         return null;
     }
+    if (spillV1Refusal(own.engine.?.mtpRing() != null)) |why| {
+        if (o.rank == 0) std.log.warn("spill: off ({s})", .{why});
+        return null;
+    }
     if (root.len == 0) {
         const home = envText("HOME") orelse return null;
         root = std.fmt.allocPrint(own.gpa, "{s}/.cache/tensorfold-spill", .{home}) catch return null;
@@ -415,18 +419,19 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
     return .{ .highwater = highwater, .flush_s = flush_s };
 }
 
+/// Spill v1 beside MTP drafts: off for now (its stored states would hold the head's section under a build key that
+/// does not name the drafter); spill v2 refuses MTP at the start (SpillV2WithMtp).
+fn spillV1Refusal(mtp: bool) ?[]const u8 {
+    return if (mtp) "MTP drafts: the spill tier does not store the MTP head's state yet; kept states stay in memory" else null;
+}
+
 /// The recipe's prompt cache for this process (rank 0 holds the store; both ranks hold the states and the reserve):
 /// budget and caps from the environment as the Python engine reads them, the machine's memory less the reserve.
 /// `v2` (TF_GLM_SPILL_V2=1): every rank meets one gather for the smallest budget (a rank's kept states and restores
 /// follow rank 0's decisions), `agreed`, and v1's tier stays shut.
 fn cacheFor(own: *Own, o: Options, build_key: u64, v2: bool, agreed: *u64) ?lane_backend.CacheHooks {
     agreed.* = 0;
-    // MTP drafts: the head's taps pair a continuation's rows with the prompt's tokens from its start (promptTaps,
-    // prompt_at), so a prefill that goes on from a kept or live state would misplace them; kept states wait for that
-    if (own.engine.?.mtp != null) {
-        if (o.rank == 0) std.log.info("prompt cache: off (MTP drafts do not resume from kept states yet)", .{});
-        return null;
-    }
+    // (MTP drafts: a kept state holds the head's section, cuda_mtp_keep; the head drafts at --parallel 1 only)
     // (spill v2: a rank that returns before its plan still meets the gather, with 0)
     var met = false;
     defer if (v2 and !met) {
@@ -744,6 +749,12 @@ pub fn prefillChunk(ctx: *anyopaque, rows: usize, pos: usize, parity: *[34]u1, h
     prefill.bindForwardHook();
     const e: *prefill.Engine = @ptrCast(@alignCast(ctx));
     try fw.enterPrompt(@ptrCast(e), rows, pos, parity, head);
+}
+
+test "MTP drafts: the prompt cache keeps their states in memory; spill v1 stays off with them, spill v2 refuses them" {
+    try std.testing.expect(spillV1Refusal(true) != null);
+    try std.testing.expect(spillV1Refusal(false) == null);
+    try std.testing.expect(std.mem.indexOf(u8, refusal(error.SpillV2WithMtp).?, "MTP head") != null);
 }
 
 test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that cannot read it a word no rank sends, and every rank refuses alike after the agreement" {

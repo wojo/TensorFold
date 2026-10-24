@@ -37,6 +37,7 @@ const cache_plan = @import("cuda_cache_plan.zig");
 const spill_mod = @import("cuda_spill.zig");
 const mtp_mod = @import("cuda_mtp.zig");
 const choice_mod = @import("cuda_mtp_choice.zig");
+const mtp_keep = @import("cuda_mtp_keep.zig");
 const vision_tower = @import("cuda_vision.zig");
 const G = state.Geometry;
 const pool_mod = @import("cuda_pool.zig");
@@ -80,6 +81,7 @@ pub const Seq = struct { slot: usize, st: state.State, alive: bool = false, tag:
 /// A kept prompt state (cuda_snapshot.zig): one device buffer holding the sequence's state after `pos` tokens.
 /// `refs`: the owner's, and one for each background write that reads the buffer (the last release frees it).
 /// `home`: TF_GLM_KV_SHARD, the part its stream lay in, whose owner alone holds its latent rows (null: unsharded).
+/// `mtp_len`: MTP drafts, the head's rows in the state (pos - 1: the head absorbs one row behind, cuda_mtp_keep).
 pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?cuda.DeviceBuffer = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
 const SpillJob = struct { snap: *Snap, tokens: []u32, at: u32, key: u64 };
 /// `mask`: structured output's bits for the first token (one row, the grammar's words); empty: unconstrained.
@@ -125,6 +127,9 @@ pub const Engine = struct {
     drafter: ?*draft_pkg.Package = null,
     mtp: ?mtp_mod.Head = null,
     draft_choice: choice_mod.Choice = .dflash2,
+    /// TF_GLM_MTP_DIGEST=1: log a hash of the MTP head's state at every keep, restore and prompt end (cuda_mtp_keep),
+    /// and each draft round's drafts
+    mtp_digest: bool = false,
     prompt_tokens: []const u32 = &.{},
     prompt_at: usize = 0,
     lt: ?cuda.cublaslt.Library = null,
@@ -219,6 +224,7 @@ pub const Engine = struct {
         e.drafter = null;
         e.mtp = null;
         e.draft_choice = o.draft_choice orelse try choice_mod.environment();
+        e.mtp_digest = if (std.c.getenv("TF_GLM_MTP_DIGEST")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         e.prompt_tokens = &.{};
         e.prompt_at = 0;
         e.lt = null;
@@ -585,7 +591,22 @@ pub const Engine = struct {
         const conv: cuda.DeviceBuffer = .{ .d = e.stream.d, .ptr = st.fixed.conv, .len = n[1] };
         try rec.fill8(0, e.stream.handle);
         try conv.fill8(0, e.stream.handle);
-        if (e.mtp) |*m| m.cursor = .{};
+        if (e.mtp) |*m| {
+            m.cursor = .{};
+            m.slot = st.slot;
+        }
+    }
+
+    /// The MTP head when it drafts (DRAFTER=mtp); a head loaded beside DFlash2 (TF_GLM_MTP=1) is never fed.
+    pub fn mtpHead(e: *Engine) ?*mtp_mod.Head {
+        if (e.mtp) |*m| if (e.drafts and e.draft_choice == .mtp) return m;
+        return null;
+    }
+
+    /// Whether the MTP head drafts (`mtpHead`), and its index ring: a kept state then holds its section.
+    pub fn mtpRing(e: *const Engine) ?usize {
+        if (e.mtp) |*m| if (e.drafts and e.draft_choice == .mtp) return m.cache.ring;
+        return null;
     }
 
     pub fn freeSeq(e: *Engine, s: *Seq) void {
@@ -785,7 +806,10 @@ pub const Engine = struct {
             begin = p;
         } else if (o.resume_from) |snap| {
             if (snap.pos == 0 or snap.pos >= prompt.len or snap.pos % 64 != 0) return error.ResumeMustExtend;
-            if (!(s.tag == snap.id and st.pos == snap.pos)) try e.restoreSnap(s, snap);
+            if (!(s.tag == snap.id and st.pos == snap.pos)) try e.restoreSnap(s, snap) else if (e.mtpHead()) |m| {
+                // the target's rows stand at the state, the head may not (one head per engine)
+                if (!mtp_keep.stands(m, s.slot, snap.pos)) try e.restoreHead(m, s, snap);
+            }
             begin = snap.pos;
         } else if (st.pos != 0) {
             // from the start on a sequence that ran rows already: its recurrent state is the start's again (position
@@ -795,9 +819,13 @@ pub const Engine = struct {
             s.tag = 0;
         }
         e.prompt_tokens = prompt;
-        e.prompt_at = 0;
+        e.prompt_at = begin;
         defer e.prompt_tokens = &.{};
-        if (e.mtp) |*m| try m.reset(e.gpa, prompt);
+        if (e.mtpHead()) |m| {
+            // from 0 the head starts empty; from a kept or live state it stands one row behind it (cuda_mtp_keep)
+            try mtp_keep.enter(m, s.slot, begin);
+            try m.resetCopies(e.gpa, prompt);
+        }
         if (e.drafter) |p| {
             try p.multi.reset(s.slot, prompt, .{});
             p.multi.contexts[s.slot].end = begin; // the window of rows [0, begin) is the restored (or live) one
@@ -830,6 +858,7 @@ pub const Engine = struct {
         if (point > begin and point < prompt.len) _ = try prefill_loop.run(&e.pe, &st.cur, .{ .tokens = ids[0..point], .begin = begin, .limit = e.prefill_rows, .head = false, .tap_ctx = e, .on_taps = promptTaps });
         _ = try prefill_loop.run(&e.pe, &st.cur, .{ .tokens = ids, .limit = e.prefill_rows, .begin = if (point < prompt.len and point > begin) point else begin, .head = true, .tap_ctx = e, .on_taps = promptTaps });
         st.pos = prompt.len;
+        if (e.mtpHead()) |m| e.logMtpDigest(m, "prompt end", prompt.len);
         var out: [1]u32 = undefined;
         const rule: ?lanes.Sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null;
         if (o.mask.len > 0) try e.maskRows(0, e.pe.b.logits, 1, o.mask);
@@ -848,7 +877,8 @@ pub const Engine = struct {
     fn sectionsHeld(e: *const Engine, at: usize, rows: bool) snapshot.Sections {
         const ring = e.caches.ring;
         const draft_bytes: usize = if (e.drafter) |p| draftOf(p, 0).bytes() else 0;
-        return snapshot.sectionsOf(e.g, at, ring, draft_bytes, rows);
+        const sec = snapshot.sectionsOf(e.g, at, ring, draft_bytes, rows);
+        return if (e.mtpRing()) |r| snapshot.withMtp(sec, r) else sec;
     }
 
     fn draftOf(p: *const draft_pkg.Package, slot: usize) snapshot.Draft {
@@ -984,6 +1014,8 @@ pub const Engine = struct {
     /// latent rows only on the rank that owns the stream's extent (a borrowed twin's are the other rank's), its home.
     pub fn takeSnap(e: *Engine, s: *Seq, at: usize) !*Snap {
         if (at == 0 or at != s.st.pos or at % 64 != 0) return error.BadKeepPoint;
+        const head = e.mtpHead();
+        if (head) |m| try mtp_keep.keepable(m, s.slot, at);
         const sec = e.sectionsHeld(at, if (e.shard) |sh| sh.owns(s.st.base) else true);
         if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
         const snap = try e.gpa.create(Snap);
@@ -993,10 +1025,12 @@ pub const Engine = struct {
         const draft: ?snapshot.Draft = if (e.drafter) |p| draftOf(p, s.slot) else null;
         if (draft != null) if (e.drafter.?.multi.contexts[s.slot].end != at) return error.BadDraftCommit;
         try snapshot.save(e.copier(), e.g, sec, buf.ptr, &s.st, draft);
+        if (head) |m| try snapshot.mtpCopy(e.copier(), sec, buf.ptr, m.plane(), true);
         try e.stream.synchronize();
         e.snap_next += 1;
-        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec, .home = if (e.shard) |sh| @intCast(sh.owner(s.st.base)) else null };
+        snap.* = .{ .id = e.snap_next, .pos = at, .mtp_len = if (head != null) at - 1 else 0, .buf = buf, .sec = sec, .home = if (e.shard) |sh| @intCast(sh.owner(s.st.base)) else null };
         s.tag = snap.id;
+        if (head) |m| e.logMtpDigest(m, "keep", at);
         return snap;
     }
 
@@ -1006,7 +1040,9 @@ pub const Engine = struct {
     pub fn restoreSnap(e: *Engine, s: *Seq, snap: *const Snap) !void {
         const buf = snap.buf orelse return error.NoStateKept;
         const draft: ?snapshot.Draft = if (e.drafter) |p| draftOf(p, s.slot) else null;
-        if ((snap.sec.draft != snap.sec.total) != (draft != null)) return error.DrafterMismatch;
+        if ((snap.sec.draftBytes() != 0) != (draft != null)) return error.DrafterMismatch;
+        const head = e.mtpHead();
+        if ((snap.sec.mtp_rows != null) != (head != null)) return error.MtpMismatch;
         var rows = true;
         if (e.shard) |sh| {
             if (s.st.cache.twin) return error.KvShardTwinRestore;
@@ -1015,10 +1051,48 @@ pub const Engine = struct {
             if (role == .send or role == .recv) try e.carryIn(role, s, snap, buf);
         }
         try snapshot.restore(e.copier(), e.g, snap.sec, buf.ptr, &s.st, draft, rows);
+        if (head) |m| try snapshot.mtpCopy(e.copier(), snap.sec, buf.ptr, m.plane(), false);
         try e.stream.synchronize();
         s.st.pos = snap.pos;
         s.tag = snap.id;
         if (e.drafter) |p| p.multi.contexts[s.slot].end = snap.pos;
+        if (head) |m| {
+            mtp_keep.restored(m, s.slot, snap.pos);
+            e.logMtpDigest(m, "restore", snap.pos);
+        }
+    }
+
+    /// The MTP head's section of a kept state alone, for a sequence whose own rows already stand at it (the head is
+    /// the engine's, so another prompt may have moved it since).
+    fn restoreHead(e: *Engine, m: *mtp_mod.Head, s: *Seq, snap: *const Snap) !void {
+        const buf = snap.buf orelse return error.NoStateKept;
+        if (snap.sec.mtp_rows == null) return error.MtpMismatch;
+        try snapshot.mtpCopy(e.copier(), snap.sec, buf.ptr, m.plane(), false);
+        try e.stream.synchronize();
+        mtp_keep.restored(m, s.slot, snap.pos);
+        e.logMtpDigest(m, "restore", snap.pos);
+    }
+
+    /// TF_GLM_MTP_DIGEST=1: the head's digest (cuda_mtp_keep.digest) in the log, with what just happened at `at`.
+    fn logMtpDigest(e: *Engine, m: *mtp_mod.Head, what: []const u8, at: usize) void {
+        if (!e.mtp_digest) return;
+        const d = e.mtpDigestOf(m) catch |err| {
+            std.log.warn("TF_GLM_MTP_DIGEST: {s} at {d} tokens: no digest ({s})", .{ what, at, @errorName(err) });
+            return;
+        };
+        std.log.info("TF_GLM_MTP_DIGEST: rank {d} {s} at {d} tokens: head rows {d}, digest {x:0>16}", .{ e.g.rank, what, at, m.cursor.len, d });
+    }
+
+    fn mtpDigestOf(e: *Engine, m: *const mtp_mod.Head) !u64 {
+        try e.stream.synchronize();
+        const scratch = try e.gpa.alloc(u8, 16 << 20);
+        defer e.gpa.free(scratch);
+        return mtp_keep.digest(.{ .ptr = e, .read = digestRead }, m.plane(), m.cursor.len, scratch);
+    }
+
+    fn digestRead(ptr: *anyopaque, dst: []u8, src: u64) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ptr));
+        try (cuda.DeviceBuffer{ .d = e.stream.d, .ptr = src, .len = dst.len }).download(0, dst);
     }
 
     /// Before any collective of a prefill (the lane layer's prepare step, then its agreement): checks the media and
@@ -1504,7 +1578,13 @@ pub const Engine = struct {
 
     pub fn draftMany(e: *Engine, reqs: []DraftReq) !void {
         if (reqs.len == 0) return;
-        if (e.mtp) |*m| if (e.draft_choice == .mtp) return mtp_mod.draftMany(m, e, reqs);
+        if (e.mtp) |*m| if (e.draft_choice == .mtp) {
+            try mtp_mod.draftMany(m, e, reqs);
+            // TF_GLM_MTP_DIGEST: each round's drafts, so a cold and a resumed run compare round by round (the next
+            // round's position gives what was accepted)
+            if (e.mtp_digest) for (reqs) |r| std.log.info("TF_GLM_MTP_DIGEST: rank {d} draft at {d}: head rows {d}, {d} drafted, {x:0>16}", .{ e.g.rank, r.seq.st.pos, m.cursor.len, r.drafted, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(r.out[0..r.drafted])) });
+            return;
+        };
         const p = e.drafter orelse return error.DrafterNotLoaded;
         try dflash.draftMany(&p.multi, e, reqs);
     }
@@ -1522,12 +1602,8 @@ pub const Engine = struct {
     fn promptTaps(ptr: *anyopaque, rows: usize) !void {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         if (e.drafter) |p| try e.absorbTaps(p, e.bound.?.slot, e.pe.b.taps, e.pe.b.rows, 0, rows);
-        if (e.mtp) |*m| if (e.drafts and e.draft_choice == .mtp) {
-            try e.torch.on(e.stream).base.copy(m.pending, e.pe.last_hidden, 8192);
-            const start = e.prompt_at;
-            const end = @min(start + rows + 1, e.prompt_tokens.len);
-            try m.prompt(e, e.prompt_tokens[start + 1 .. end], e.pe.b.normed);
-        };
+        // the head one row behind: this chunk's rows from the one before it, its last row pending (cuda_mtp_keep)
+        if (e.mtpHead()) |m| try mtp_keep.feed(m, e, e.prompt_tokens, e.prompt_at, rows, e.pe.b.normed, e.pe.last_hidden);
         e.prompt_at += rows;
     }
 
@@ -1635,6 +1711,89 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
     try e.commitDrafts(&.{.{ .state = &st, .tokens = &.{ 1, 2 } }}, &.{1});
     try std.testing.expect(e.committed[0]);
     try std.testing.expect(!e.committed[1]);
+}
+
+/// A host engine with an MTP head standing at `len` rows for slot 0 (no device: what is checked before any copy).
+fn hostMtpEngine(e: *Engine, choice: choice_mod.Choice, len: usize) void {
+    e.gpa = std.testing.allocator;
+    e.g = G.init(2, 0) catch unreachable;
+    e.context = 4096;
+    e.caches.ring = 2112;
+    e.drafter = null;
+    e.shard = null;
+    e.keep_reserve = 0;
+    e.mtp_digest = false;
+    e.drafts = true;
+    e.draft_choice = choice;
+    var h: mtp_mod.Head = undefined;
+    h.cache.ring = 2048 + 64;
+    h.cursor = .{ .len = len };
+    h.slot = 0;
+    h.copies = null;
+    e.mtp = h;
+    e.media = null;
+    e.prompt_tokens = &.{};
+}
+
+test "MTP drafts: a kept state holds the head's section only when the head drafts; one loaded beside DFlash2 (TF_GLM_MTP=1) adds none" {
+    var e: Engine = undefined;
+    hostMtpEngine(&e, .dflash2, 0);
+    const plain = snapshot.sections(e.g, 4096, 2112, 0);
+    try std.testing.expect(e.mtpHead() == null and e.mtpRing() == null);
+    try std.testing.expectEqual(plain.total, e.snapBytes(4096));
+    e.draft_choice = .mtp;
+    try std.testing.expect(e.mtpHead() != null);
+    try std.testing.expectEqual(@as(?usize, 2112), e.mtpRing());
+    const sec = e.sectionsFor(4096);
+    try std.testing.expectEqual(@as(?usize, 4095), sec.mtp_rows);
+    try std.testing.expectEqual(snapshot.withMtp(plain, 2112).total, e.snapBytes(4096));
+    // the budget's fixed size (a state at 0) counts the head's rings and tail too
+    try std.testing.expect(e.snapBytes(0) > snapshot.sections(e.g, 0, 2112, 0).total);
+    e.drafts = false;
+    try std.testing.expect(e.mtpHead() == null);
+    e.drafts = true;
+    e.mtp = null;
+    try std.testing.expect(e.mtpHead() == null and e.mtpRing() == null);
+}
+
+test "MTP drafts: a save is refused unless the head stands one row behind it, a restore unless the state matches the drafter, before any copy" {
+    var e: Engine = undefined;
+    hostMtpEngine(&e, .mtp, 100);
+    var seq: Seq = .{ .slot = 0, .st = undefined, .alive = true };
+    seq.st.pos = 128;
+    try std.testing.expectError(error.BadMtpCursor, e.takeSnap(&seq, 128));
+    e.mtp.?.cursor = .{ .len = 127, .drafted = 1 };
+    try std.testing.expectError(error.BadMtpCursor, e.takeSnap(&seq, 128));
+    e.mtp.?.cursor = .{ .len = 127 };
+    e.mtp.?.slot = 1;
+    try std.testing.expectError(error.BadMtpCursor, e.takeSnap(&seq, 128));
+    // a state kept without the head's section (DFlash2, or no drafts) does not restore into a drafting head, nor one with it
+    // into an engine whose head does not draft
+    var snap: Snap = .{ .id = 1, .pos = 128, .buf = .{ .d = undefined, .ptr = 0x1000, .len = 1 }, .sec = snapshot.sections(e.g, 128, 2112, 0) };
+    try std.testing.expectError(error.MtpMismatch, e.restoreSnap(&seq, &snap));
+    e.draft_choice = .dflash2;
+    snap.sec = snapshot.withMtp(snap.sec, 2112);
+    try std.testing.expectError(error.MtpMismatch, e.restoreSnap(&seq, &snap));
+    // the target's rows standing at the state (its tag) but no head section: the head is not put back from nothing
+    e.draft_choice = .mtp;
+    snap.sec = snapshot.sections(e.g, 128, 2112, 0);
+    e.mtp.?.slot = 0;
+    e.mtp.?.cursor = .{ .len = 40 };
+    try std.testing.expectError(error.MtpMismatch, e.restoreHead(&e.mtp.?, &seq, &snap));
+}
+
+test "MTP drafts: a prompt goes on from live rows (a refused save) only where the head stands" {
+    var e: Engine = undefined;
+    hostMtpEngine(&e, .mtp, 100);
+    var seq: Seq = .{ .slot = 0, .st = undefined, .alive = true };
+    seq.st.pos = 128;
+    e.bound = &seq;
+    var prompt: [200]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i);
+    try std.testing.expectError(error.MtpNotAtResume, e.prefillWith(&prompt, null, .{ .live_from = 128 }));
+    e.mtp.?.slot = 1;
+    e.mtp.?.cursor = .{ .len = 127 };
+    try std.testing.expectError(error.MtpNotAtResume, e.prefillWith(&prompt, null, .{ .live_from = 128 }));
 }
 
 /// A host engine of TF_GLM_KV_SHARD's pool for rank `r` (no device: views are arithmetic over made-up planes).

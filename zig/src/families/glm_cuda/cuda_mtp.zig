@@ -10,6 +10,7 @@ const pf = @import("cuda_prefill.zig");
 const mm = @import("cuda_matmuls.zig");
 const seg = @import("cuda_segments.zig");
 const copy_mod = @import("cuda_copy_drafts.zig");
+const snapshot = @import("cuda_snapshot.zig");
 const Tri = @import("cuda_triton.zig").Tri;
 
 /// Only chained rows are speculative. Accepted target rows always replace them on absorb.
@@ -46,8 +47,11 @@ pub const Head = struct {
     hin: u64,
     cat: u64,
     mx: u64,
+    /// the target's normed hidden row the head absorbs next (after a prompt chunk: its last row, cuda_mtp_keep)
     pending: u64,
     cursor: Cursor = .{},
+    /// the stream slot whose rows the head holds (a prompt from 0 takes it; cuda_mtp_keep checks it on a resume)
+    slot: ?usize = null,
     copies: ?copy_mod.Copy = null,
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: state.Geometry, capacity: usize) !Head {
         var cache = try state.Caches.initMtp(d, capacity, 2048);
@@ -67,8 +71,8 @@ pub const Head = struct {
         const pending = arena.take(sizes[4]);
         return .{ .cache = cache, .b = b, .tables = tables, .arena = arena, .me = me, .hin = hin, .cat = cat, .mx = mx, .pending = pending };
     }
-    pub fn reset(h: *Head, gpa: std.mem.Allocator, prompt_ids: []const u32) !void {
-        h.cursor = .{};
+    /// The n-gram copies table, from the whole prompt (each prompt pass; the cursor is cuda_mtp_keep.enter's).
+    pub fn resetCopies(h: *Head, gpa: std.mem.Allocator, prompt_ids: []const u32) !void {
         if (h.copies) |*c| c.deinit();
         h.copies = null;
         if (std.c.getenv("TF_GLM_COPY_DRAFTS")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return;
@@ -82,7 +86,12 @@ pub const Head = struct {
         h.b.deinit();
         h.cache.deinit();
     }
-    fn stage(h: *Head, e: anytype, tokens: []const u32, hidden: u64, ids: u64, max_rows: usize) !void {
+    /// The head's live plane and pending row, as a kept state's MTP section holds them (cuda_snapshot.mtpCopy).
+    pub fn plane(h: *const Head) snapshot.MtpPlane {
+        return .{ .latent = h.cache.latent[0], .pooled = h.cache.pooled[0], .keys = h.cache.keys[0], .gates = h.cache.gates[0], .ring = h.cache.ring, .pending = h.pending };
+    }
+    /// `tail`: the first row's hidden input is the pending row, the rest are `hidden`'s rows from its first.
+    fn stage(h: *Head, e: anytype, tokens: []const u32, hidden: u64, ids: u64, max_rows: usize, tail: bool) !void {
         if (tokens.len == 0 or tokens.len > max_rows or h.cursor.len + tokens.len > h.cache.rows) return error.BadMtpRows;
         var host: [2048]i32 = undefined;
         for (tokens, 0..) |v, i| {
@@ -91,7 +100,11 @@ pub const Head = struct {
         }
         try e.stream.synchronize();
         try (cuda.DeviceBuffer{ .d = e.stream.d, .ptr = ids, .len = max_rows * 4 }).upload(0, std.mem.sliceAsBytes(host[0..tokens.len]));
-        try e.torch.on(e.stream).base.copy(h.hin, hidden, tokens.len * 8192);
+        const th = e.torch.on(e.stream).base;
+        if (tail) {
+            try th.copy(h.hin, h.pending, 8192);
+            if (tokens.len > 1) try th.copy(h.hin + 8192, hidden, (tokens.len - 1) * 8192);
+        } else try th.copy(h.hin, hidden, tokens.len * 8192);
     }
     fn inputs(h: *Head, e: anytype, ids: u64, rows: usize) !void {
         const w = e.prepared.weights.mtp.?;
@@ -103,16 +116,21 @@ pub const Head = struct {
         if (e.comm) |cm| try cm.allGather(part, gathered, rows * 4096, .f32, e.stream.handle);
         try residual(e.fwd.tri, h.mx, if (e.g.world == 1) part else gathered, rows, e.g.world);
     }
-    /// Prompt arithmetic: use the prefill projections and DSA/MoE kernels, with the MTP cache and origin.
-    /// The target's last hidden row is saved separately; its logits are retained for first-token sampling.
-    pub fn prompt(h: *Head, e: anytype, next: []const u32, hidden: u64) !void {
-        if (next.len == 0) return;
+    /// Prompt arithmetic: use the prefill projections and DSA/MoE kernels, with the MTP cache, its ring and origin.
+    /// One prompt chunk's rows one behind the target (cuda_mtp_keep.feed): `tokens` with the pending row first when
+    /// `tail`, then `hidden`'s; `last`, the chunk's last row, is pending after. The target's logits are left alone.
+    pub fn absorb(h: *Head, e: anytype, tokens: []const u32, hidden: u64, last: u64, tail: bool) !void {
+        const th = e.torch.on(e.stream).base;
+        if (tokens.len == 0) return th.copy(h.pending, last, 8192);
         var p = e.pe;
-        try h.stage(e, next, hidden, p.b.ids, p.b.rows);
-        const rows = next.len;
+        try h.stage(e, tokens, hidden, p.b.ids, p.b.rows, tail);
+        // the next tail, before the head's layers write over the prompt buffers that hold it
+        try th.copy(h.pending, last, 8192);
+        const rows = tokens.len;
         const w = e.prepared.weights.mtp.?;
         try h.inputs(e, p.b.ids, rows);
         p.cache = try h.cache.view(0, h.cache.rows, 0);
+        p.ring = h.cache.ring;
         p.pos_dev = e.bound.?.st.fixed.mtp_pos_dev;
         try p.putI32(p.pos_dev, @intCast(h.cursor.len));
         const blocks = (rows + 511) / 512;
@@ -127,7 +145,7 @@ pub const Head = struct {
         h.cursor.advance(rows, false);
     }
     pub fn step(h: *Head, e: anytype, next: []const u32, hidden: u64, speculative: bool) !u64 {
-        try h.stage(e, next, hidden, h.b.ids, h.b.rows);
+        try h.stage(e, next, hidden, h.b.ids, h.b.rows, false);
         const rows = next.len;
         const w = e.prepared.weights.mtp.?;
         try h.inputs(e, h.b.ids, rows);

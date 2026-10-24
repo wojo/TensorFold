@@ -191,6 +191,11 @@ test {
     _ = snapshot;
 }
 
+pub const mtp_keep = @import("cuda_mtp_keep.zig"); // MTP drafts with kept prompt states: the head one row behind
+test {
+    _ = mtp_keep;
+}
+
 pub const cache_plan = @import("cuda_cache_plan.zig"); // the recipe's kept-prompt settings and memory plan
 test {
     _ = cache_plan;
