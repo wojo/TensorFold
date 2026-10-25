@@ -132,6 +132,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
             std.debug.print("tensorfold: TENSORFOLD_PREPARE_FLOOR_GIB={s}: a number of GiB, 0 for no gate\n", .{env(s, "TENSORFOLD_PREPARE_FLOOR_GIB").?});
             return 1;
         },
+        .prepare_wait_ms = prepare_gate.waitMs(env(s, "TENSORFOLD_PREPARE_WAIT_MS")) catch {
+            std.debug.print("tensorfold: TENSORFOLD_PREPARE_WAIT_MS={s}: whole milliseconds, at most a day\n", .{env(s, "TENSORFOLD_PREPARE_WAIT_MS").?});
+            return 1;
+        },
+        .prepare_max_waiting = prepare_gate.maxWaiting(env(s, "TENSORFOLD_PREPARE_MAX_WAITING")) catch {
+            std.debug.print("tensorfold: TENSORFOLD_PREPARE_MAX_WAITING={s}: a count of prepares, 0 for no bound\n", .{env(s, "TENSORFOLD_PREPARE_MAX_WAITING").?});
+            return 1;
+        },
         .slide_graph = args.slide_graph,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {

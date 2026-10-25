@@ -65,6 +65,10 @@ pub const Config = struct {
     /// TENSORFOLD_PREPARE_FLOOR_GIB: the MemAvailable a prompt's render and tokenization leave at least while others
     /// are in flight (prepare_gate); 0: no gate.
     prepare_floor_gib: f64 = prepare_gate.default_floor_gib,
+    /// TENSORFOLD_PREPARE_WAIT_MS: how long a waiting prepare waits for memory before it goes with none in flight.
+    prepare_wait_ms: u64 = prepare_gate.default_wait_ms,
+    /// TENSORFOLD_PREPARE_MAX_WAITING: the prepares that may wait at once (0: no bound); one more is refused (capacity).
+    prepare_max_waiting: u32 = prepare_gate.default_max_waiting,
     /// The GLM recipe's switches (TF_GLM_*), read at start; `recipe.glm` turns its server behaviours on.
     recipe: recipe_mod.Recipe = .{},
 };
@@ -118,7 +122,7 @@ pub const Server = struct {
         @import("glm_keys.zig").enabled = config.recipe.glm; // a missing <arg_key> is put back by the end parser
         errors.capacity_status = if (config.recipe.glm) 429 else 503; // the recipe: 429 + Retry-After: 5, not a bare 503 (patch 0081)
         const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .gate = .init(config.prepare_floor_gib), .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .gate = .configured(config.prepare_floor_gib, config.prepare_wait_ms, config.prepare_max_waiting), .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
             srv.keepalive = api.keepalive.Keepalive.start(gpa, io, target, @as(i64, config.keep_warm_s) * std.time.ns_per_s) catch |e| blk: {
                 log.line("idle keepalive off: {s}", .{@errorName(e)});

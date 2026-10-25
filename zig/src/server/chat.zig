@@ -175,9 +175,13 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
     // the renders and tokenizations take memory in proportion to the text (prompt and history, and the rewind probe
     // with the prompt cache on); under the memory floor they wait for the ones in flight (prepare_gate), and hold the
-    // reservation until prepare returns. GLM's kept reasoning goes back first, so the reservation counts it.
+    // reservation until prepare returns, in arrival order; past the gate's waiter bound a request is refused as one past
+    // the lanes is (429 under the recipe). GLM's kept reasoning goes back first, so the reservation counts it.
     const sent = try prompt_mod.withKept(srv, a, input);
-    const ticket = try srv.gate.enter(io, srv.gate.need(promptBytes(sent)), gone);
+    const ticket = srv.gate.enter(io, srv.gate.need(promptBytes(sent)), gone) catch |e| switch (e) {
+        error.Cancelled => return error.Cancelled,
+        error.Full => return cx.fail(.capacity, "{s}", .{prepare_gate.full_message}),
+    };
     defer srv.gate.leave(io, ticket);
     const rendered = try prompt_mod.prepare(srv, cx, sent, thinking, effort);
     if (gone.check()) return error.Cancelled;

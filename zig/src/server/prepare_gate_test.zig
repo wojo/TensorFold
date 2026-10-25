@@ -383,7 +383,7 @@ test "a chat request waits at the gate before it renders anything, and gives its
     var g: Glm = .{};
     try g.start(gpa);
     defer g.finish();
-    g.srv.gate = .init(3);
+    g.srv.gate = .configured(3, 0, prepare_gate.default_max_waiting);
     g.srv.gate.avail = fakeAvail;
     fake_avail.store(4 << 30, .release); // under the 2 GiB held, the request's own and the 3 GiB floor
     var request = std.heap.ArenaAllocator.init(gpa);
@@ -416,4 +416,60 @@ test "a chat request waits at the gate before it renders anything, and gives its
     try std.testing.expectEqual(@as(u64, 1), g.srv.gate.waited);
     try std.testing.expectEqual(@as(u32, 0), g.srv.gate.inflight);
     try std.testing.expectEqual(@as(u64, 0), g.srv.gate.reserved);
+}
+
+test "a chat request past the gate's waiter bound is refused as a capacity refusal (429 under the recipe), having rendered nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var g: Glm = .{};
+    try g.start(gpa);
+    defer g.finish();
+    g.srv.gate = .configured(3, 60_000, 1);
+    g.srv.gate.avail = fakeAvail;
+    fake_avail.store(16 << 30, .release);
+    const first = try g.srv.gate.enter(io, 2 << 30, Never{});
+    fake_avail.store(1 << 30, .release); // nothing more fits
+    // one waits (the bound)
+    const Waits = struct {
+        fn run(gate: *prepare_gate.Gate, left: *std.atomic.Value(bool), out: *?anyerror) void {
+            const F = struct {
+                l: *std.atomic.Value(bool),
+                pub fn check(f: @This()) bool {
+                    return f.l.load(.acquire);
+                }
+            };
+            const t = gate.enter(std.testing.io, 1 << 20, F{ .l = left }) catch |e| {
+                out.* = e;
+                return;
+            };
+            gate.leave(std.testing.io, t);
+        }
+    };
+    var left: std.atomic.Value(bool) = .init(false);
+    var waited: ?anyerror = null;
+    const th = try std.Thread.spawn(.{}, Waits.run, .{ &g.srv.gate, &left, &waited });
+    for (0..200) |_| {
+        if (g.srv.gate.waiters(io) == 1) break;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(u32, 1), g.srv.gate.waiters(io));
+    var request = std.heap.ArenaAllocator.init(gpa);
+    defer request.deinit();
+    const body = (try json.parse(request.allocator(), try conversation(request.allocator(), 4 << 10, true))).ok;
+    var tally: Tally = .{ .child = request.allocator() };
+    var cx: errors.Cx = .{ .a = tally.allocator() };
+    const before = tally.bytes.load(.monotonic);
+    try std.testing.expectError(error.Refused, chat.prepare(g.srv, &cx, .{ .messages = body.get("messages").?, .tools = body.get("tools").?.array, .fields = body }, Never{}));
+    try std.testing.expectEqual(errors.Kind.capacity, cx.kind);
+    try std.testing.expectEqual(errors.capacity_status, cx.status());
+    try std.testing.expectEqualStrings(prepare_gate.full_message, cx.message);
+    // the refusal's message is all it allocated: no render ran
+    try std.testing.expect(tally.bytes.load(.monotonic) - before < 4 << 10);
+    try std.testing.expectEqual(@as(u64, 1), g.srv.gate.refused);
+    try std.testing.expectEqual(@as(i64, 0), g.srv.preparing.load(.acquire));
+    left.store(true, .release);
+    th.join();
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), waited);
+    g.srv.gate.leave(io, first);
+    try std.testing.expectEqual(@as(u32, 0), g.srv.gate.inflight);
 }
