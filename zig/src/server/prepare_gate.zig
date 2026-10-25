@@ -5,9 +5,10 @@
 //! them at once can take MemAvailable to zero. Each prepare reserves `per_byte` bytes for every byte of its text and
 //! goes when MemAvailable, less what the ones in flight reserved, stays at the floor or over with its own reservation.
 //! Prepares that cannot go wait in arrival order: only the oldest waiter may go, so a large prepare is never starved by
-//! a stream of small ones that would each fit beside the ones in flight (they queue behind it). A waiter waits for
-//! memory at most `TENSORFOLD_PREPARE_WAIT_MS`; past it, it goes as soon as none is in flight (it can never wait on
-//! itself, so the gate never deadlocks; 0 gives that rule at once, as before the order). At most
+//! a stream of small ones that would each fit beside the ones in flight (they queue behind it). A prepare that arrives
+//! with none in flight and no earlier waiter always goes at once, as before the order (no prepare's end could free
+//! memory for it). A waiter waits for memory at most `TENSORFOLD_PREPARE_WAIT_MS`; past it, it goes as soon as none is
+//! in flight (it can never wait on itself, so the gate never deadlocks; 0 gives that rule at once). At most
 //! `TENSORFOLD_PREPARE_MAX_WAITING` prepares wait; one more is refused (`error.Full`, which chat.prepare answers as a
 //! capacity refusal: 429 with `Retry-After` under the GLM recipe, else 503). The gate only ever turns concurrent
 //! prepares into queued ones; it changes no reply. Off with a floor of 0, and where MemAvailable cannot be read (no
@@ -21,9 +22,10 @@ const Value = json.Value;
 pub const env = [_][]const u8{ "TENSORFOLD_PREPARE_FLOOR_GIB", "TENSORFOLD_PREPARE_WAIT_MS", "TENSORFOLD_PREPARE_MAX_WAITING" };
 /// TENSORFOLD_PREPARE_FLOOR_GIB unset: the MemAvailable a prepare leaves at least, in GiB.
 pub const default_floor_gib: f64 = 3;
-/// TENSORFOLD_PREPARE_WAIT_MS unset: how long a waiter waits for memory before it goes with none in flight. Long
-/// enough for what frees rank 0's memory beside the prepares (a restore's staging, a finished request's arena), short
-/// enough that a GB10 already under its floor delays a lone request by seconds, not for good.
+/// TENSORFOLD_PREPARE_WAIT_MS unset: how long a waiter (one queued behind prepares in flight) waits for memory before
+/// it goes with none in flight. Long enough for what frees rank 0's memory beside the prepares (a restore's staging, a
+/// finished request's arena), short enough that on a GB10 already under its floor a queued request waits seconds, not
+/// for good. A prepare that finds the gate empty never waits.
 pub const default_wait_ms: u64 = 5000;
 /// TENSORFOLD_PREPARE_MAX_WAITING unset: the prepares that may wait at once (0: no bound). Every lane's request and
 /// a queue of the same size several times over; past it a client is told to retry rather than held unseen.
@@ -96,7 +98,9 @@ pub const Gate = struct {
         if (g.floor == 0) return .{};
         var me: Waiter = .{ .bytes = bytes, .since = std.Io.Clock.awake.now(io).toNanoseconds() };
         g.mutex.lockUncancelable(io);
-        if (g.first == null and g.goes(io, &me) != .wait) return g.take(io, &me, null);
+        // uncontended (none in flight, no earlier waiter): it goes at once, as before the order, even under the floor:
+        // no prepare's end can free memory for it, so waiting would only add latency
+        if (g.first == null and (g.inflight == 0 or g.goes(io, &me) != .wait)) return g.take(io, &me, null);
         if (g.max_waiting > 0 and g.waiting >= g.max_waiting) {
             g.refused += 1;
             const n = g.waiting;
@@ -458,35 +462,42 @@ fn untilWaiting(g: *Gate, n: u32) !void {
     return error.TestUnexpectedResult;
 }
 
-test "a prepare that would take MemAvailable under the floor waits at most TENSORFOLD_PREPARE_WAIT_MS, and then goes only with none in flight" {
+test "a waiter queued behind a prepare in flight waits for memory at most TENSORFOLD_PREPARE_WAIT_MS, and then goes only with none in flight" {
     const io = std.testing.io;
     var g = Gate.configured(3, 100, default_max_waiting);
     g.avail = fakeAvail;
-    fake_avail.store(1 << 30, .release); // under the floor whatever goes
-    // alone, it waits for memory the maximum, then goes (never for good)
-    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
-    const a = try g.enter(io, 1 << 20, Never{});
-    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
-    try std.testing.expect(a.held);
-    try std.testing.expect(took >= 100 * std.time.ns_per_ms and took < 5 * std.time.ns_per_s);
-    try std.testing.expectEqual(@as(u64, 1), g.waited);
-    try std.testing.expectEqual(@as(u64, 1), g.overdue);
-    // past the maximum, a second still waits while the first is in flight, and goes once it has left
     var order: std.atomic.Value(u32) = .init(0);
+    // past the maximum, a waiter still waits while the one in flight is there, and goes once it has left
+    fake_avail.store(16 << 30, .release);
+    const a = try g.enter(io, 1 << 20, Never{});
+    fake_avail.store(1 << 30, .release); // under the floor whatever goes
     var b: Prep = .{ .bytes = 1 << 20 };
-    const th = try std.Thread.spawn(.{}, Prep.run, .{ &b, &g, &order });
+    const tb = try std.Thread.spawn(.{}, Prep.run, .{ &b, &g, &order });
     std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
     try std.testing.expect(!b.done.load(.acquire));
     g.leave(io, a);
-    th.join();
+    tb.join();
     try b.result;
-    try std.testing.expectEqual(@as(u32, 0), b.at);
-    try std.testing.expectEqual(@as(u64, 2), g.overdue);
-    // a wait of 0: with none in flight it goes at once, as before arrival order
-    g.max_wait_ns = 0;
+    try std.testing.expectEqual(@as(u64, 1), g.waited);
+    try std.testing.expectEqual(@as(u64, 1), g.overdue);
+    // the one in flight leaves at once: the waiter, memory still short, waits out the maximum (never for good)
+    fake_avail.store(16 << 30, .release);
     const c = try g.enter(io, 1 << 20, Never{});
-    try std.testing.expectEqual(@as(u64, 2), g.waited);
+    fake_avail.store(1 << 30, .release);
+    var d: Prep = .{ .bytes = 1 << 20 };
+    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+    const td = try std.Thread.spawn(.{}, Prep.run, .{ &d, &g, &order });
+    try untilWaiting(&g, 1);
     g.leave(io, c);
+    td.join();
+    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
+    try d.result;
+    try std.testing.expect(took >= 100 * std.time.ns_per_ms and took < 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, 2), g.overdue);
+    // uncontended again: at once, not counted as a wait
+    const e = try g.enter(io, 1 << 20, Never{});
+    try std.testing.expectEqual(@as(u64, 2), g.waited);
+    g.leave(io, e);
     try std.testing.expectEqual(@as(u32, 0), g.inflight);
     try std.testing.expectEqual(@as(u64, 0), g.reserved);
 }
@@ -557,4 +568,22 @@ test "a waiter whose client leaves gives up its place: the one behind it moves u
     try std.testing.expectEqual(@as(u32, 0), g.inflight);
     try std.testing.expectEqual(@as(u64, 0), g.reserved);
     try std.testing.expect(g.first == null and g.last == null);
+}
+
+test "uncontended: with nothing in flight and no waiter a prepare goes at once, even under the floor, and nothing counts it as waiting" {
+    const io = std.testing.io;
+    var g = Gate.init(3); // the default wait (5000 ms) and waiter bound
+    g.avail = fakeAvail;
+    fake_avail.store(1 << 30, .release); // MemAvailable under the 3 GiB floor
+    const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+    const a = try g.enter(io, 1 << 30, Never{});
+    const took: u64 = @intCast(std.Io.Clock.awake.now(io).toNanoseconds() - t0);
+    try std.testing.expect(a.held);
+    try std.testing.expect(took < 50 * std.time.ns_per_ms);
+    // it never joined the queue: no wait counted, nothing overdue, so no "prepare waits" or "goes after" line
+    try std.testing.expectEqual(@as(u64, 0), g.waited);
+    try std.testing.expectEqual(@as(u64, 0), g.overdue);
+    try std.testing.expectEqual(@as(u32, 0), g.waiting);
+    try std.testing.expectEqual(@as(u32, 1), g.inflight);
+    g.leave(io, a);
 }
