@@ -42,7 +42,8 @@ profile supplies no value. Registry metadata comes directly from the table. Regi
 Coverage includes:
 
 - Qwen3.5 dense/MoE on CUDA: `TF_QWEN_KV_PAGES`, `TF_QWEN_KV_PAGES_ALL`, `TF_QWEN_KV_SHARE`.
-- GLM on CUDA: `TF_KV_PAGES`, `TF_GLM_KV_HOST`, `TF_GLM_KV_HOST_SHARED`, `TF_GLM_PROMPT_TAIL`.
+- GLM on CUDA: `TF_KV_PAGES`, `TF_GLM_KV_HOST`, `TF_GLM_KV_HOST_SHARED`, `TF_GLM_KV_SPLIT` (`1` or `on`),
+  `TF_GLM_PROMPT_TAIL`.
 - Nemotron and Nemotron Omni on CUDA: `TF_KV_PAGES`, with their existing default-on parser.
 - Gemma 4, Kolibri-1, Spark2.5 and GLM on the core CUDA page adapter: `TF_KV_SHARE`, where the adapter is served.
 - Every CUDA family whose host prompt cache the CUDA host builds (Nemotron, Nemotron Omni, GLM, MiniMax M3, Qwen3.5
