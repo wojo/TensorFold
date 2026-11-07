@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- GLM-5.3-Flash on CUDA: `TF_GLM_KV_SPLIT=1`, off by default, takes each stream's KV pages from one owner rank's class and lays each page's pooled keys and latent rows in two regions, each with its own table; ranks that disagree stop before loading. In this part every rank still holds every latent row, so it saves no memory, and a class holds a whole window, so a split server can admit fewer streams. Unset, the pool and the pages are as before (#2415, part 1 of #1431). Thanks to @wojo.
+
 - GLM-5.3-Flash on CUDA: prompts take the TF_GLM_INDEX_CUDA kernels by default (0 keeps tf_glm_scores), with the same tokens; at TP=2 on two GB10s prompts are 44% faster at 2K and 31% at 8K, level at 32K (#3159). Thanks to @Bizuayeu.
 
 - Living Weights (`--slide --slide-drift-gate`): the recall wordings a request supplies are held out of the lesson writer's plan. A planned question that matches one under the gate's own contamination check is dropped and replaced, so the gate no longer refuses a lesson as "supplied recall is missing or trained" for a wording the writer made itself; a lesson that can't reach its three-example floor without them is refused as "the plan could not avoid the supplied recall wordings". With no recall supplied, or the gate off, nothing changes (#2929, for #1389). Thanks to @jimthedj65 for the panel run that found it.
