@@ -35,7 +35,22 @@ const F = struct {
         if (v == 0xFFFF_FFFF) fills.append(gpa, .{ p, n }) catch return 2;
         return 0;
     }
+    var lazy = false; // as GB10 copies a pageable upload over 128 bytes: the source is read after the call returns
+    var later: std.ArrayList(struct { u64, ?*const anyopaque, usize }) = .empty;
     fn put(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
+        if (lazy) {
+            later.append(gpa, .{ dst, src, n }) catch return 2;
+            return 0;
+        }
+        return copy(dst, src, n);
+    }
+    /// The lazy uploads, read from their sources now.
+    fn settle() void {
+        lazy = false;
+        for (later.items) |x| _ = copy(x[0], x[1], x[2]);
+        later.clearAndFree(gpa);
+    }
+    fn copy(dst: u64, src: ?*const anyopaque, n: usize) cuda.abi.Result {
         const ids: [*]const u32 = @ptrCast(@alignCast(src.?));
         puts += 1;
         for (&at, &words) |*a, *w| if (a.* == 0 or (dst >= a.* and dst < a.* + 128)) {
@@ -66,6 +81,7 @@ pub const Fake = struct {
         F.puts = 0;
         F.at = @splat(0);
         F.fills.clearRetainingCapacity();
+        F.lazy = false;
         f.d = undefined;
         f.d.api.cuMemAlloc_v2 = F.alloc;
         f.d.api.cuMemFree_v2 = F.free;
@@ -179,6 +195,29 @@ test "GLM KV split: a stream's ids reach both tables, the latent one its owner's
     try expectEqual(@as(?u32, 1), f.st(2).owner);
     p.close(2);
     try expectEqual(@as(?u32, null), f.st(2).owner);
+}
+
+/// Fills a stack frame where an upload's source would have been, so a source that did not outlive its call shows.
+noinline fn clobber() u32 {
+    var junk: [1024]u32 = undefined;
+    @memset(&junk, 0xEEEE_EEEE);
+    std.mem.doNotOptimizeAway(&junk);
+    return junk[7];
+}
+
+test "GLM KV split: the latent table's upload reads a source that outlives the call, as a copy read later would" {
+    var f: Fake = undefined;
+    try f.init(true);
+    const p = try f.pool(4, 16, true);
+    defer f.deinit(p);
+    _ = try p.open(1, 600, 100); // a stream before, as the served one came after another
+    p.close(1);
+    F.lazy = true;
+    const ids = try p.openOn(2, 3000, 100, 0); // 7 pages of this rank's class
+    _ = clobber();
+    F.settle();
+    try std.testing.expectEqualSlices(u32, ids, F.table(f.st(2).table, ids.len));
+    for (ids, F.table(f.st(2).ltable, ids.len)) |id, local| try expectEqual(id / 2, local);
 }
 
 test "GLM KV split: TF_KV_POISON fills a stream's pooled keys, and its latent rows only on the rank that holds them" {

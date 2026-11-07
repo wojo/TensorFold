@@ -63,6 +63,7 @@ pub const Pages = struct {
     host_ptr: u64 = 0,
     pk_arena: ?cuda.DeviceBuffer = null, // TF_GLM_KV_HOST: the pooled keys' device pages
     leases: []kv.Lease, // slot i's: rank 0's lease, or the ids another rank mapped
+    lat_ids: []u32 = &.{}, // TF_GLM_KV_SPLIT: slot i's latent table entries from tableLen x i, the upload's source
     used: []bool,
     leader: bool,
     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
@@ -106,6 +107,8 @@ pub const Pages = struct {
         errdefer if (p.pk_arena) |*a| a.free();
         p.leases = try gpa.alloc(kv.Lease, streams);
         errdefer gpa.free(p.leases);
+        if (l.classes > 1) p.lat_ids = try gpa.alloc(u32, streams * tableLen(e.capacity));
+        errdefer gpa.free(p.lat_ids);
         @memset(p.leases, .{});
         p.used = try gpa.alloc(bool, streams);
         errdefer gpa.free(p.used);
@@ -186,6 +189,7 @@ pub const Pages = struct {
             if (p.leader and u) p.pool.finish(l) else l.ids.deinit(p.gpa);
         }
         p.gpa.free(p.leases);
+        p.gpa.free(p.lat_ids);
         p.gpa.free(p.used);
         if (p.arena) |*a| a.free();
         if (p.host) |*h| h.free();
@@ -334,14 +338,12 @@ pub const Pages = struct {
             try e.d.check(e.d.api.cuMemcpyHtoD_v2(st.table + from * 4, bytes.ptr, bytes.len), "cuMemcpyHtoD");
             if (st.ltable == 0) return;
             // TF_GLM_KV_SPLIT: each id's place in this rank's latent region, or the trash page where another holds it
-            var local: [64]u32 = undefined;
-            var at = from;
-            while (at < ids.len) {
-                const n = @min(local.len, ids.len - at);
-                for (local[0..n], ids[at..][0..n]) |*x, id| x.* = u.p.region().entry(id);
-                try e.d.check(e.d.api.cuMemcpyHtoD_v2(st.ltable + at * 4, &local, n * 4), "cuMemcpyHtoD");
-                at += n;
-            }
+            const t = tableLen(e.capacity);
+            if (ids.len > t or u.p.lat_ids.len < (u.slot + 1) * t) return error.BadStep;
+            const local = u.p.lat_ids[u.slot * t ..][0..ids.len]; // the source outlives the call, as `ids` does (GB10)
+            for (local[from..], ids[from..]) |*x, id| x.* = u.p.region().entry(id);
+            const lb = std.mem.sliceAsBytes(local[from..]);
+            try e.d.check(e.d.api.cuMemcpyHtoD_v2(st.ltable + from * 4, lb.ptr, lb.len), "cuMemcpyHtoD");
         }
     };
 };
