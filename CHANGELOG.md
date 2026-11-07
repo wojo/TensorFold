@@ -6,6 +6,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - GLM-5.3-Flash on CUDA: `--learn-conversations` keeps kept prompt states on disk, every rank's part in rank 0's store, so a conversation resumes after its in-memory state is evicted or the server restarts; a damaged file, or one written by another number of ranks, is refused by name, and the turn tries one shorter state, as after any refused disk read, then prefills. `--spill-gib` and `--checkpoint-slots` are refused for GLM, and so are `TF_KV_SHARE`, whose prefix pages lie outside the lease the image reads, and `TF_GLM_KV_LIVE_HALF=1`, whose keeps hold one KDA half where the image holds both. Off: nothing changes (#1411). Thanks to @wojo.
 
+- GLM-5.3-Flash on CUDA: `TF_GLM_KV_SPLIT=1`, off by default, takes each stream's KV pages from one owner rank's class and lays each page's pooled keys and latent rows in two regions, each with its own table; ranks that disagree stop before loading. In this part every rank still holds every latent row, so it saves no memory, and a class holds a whole window, so a split server can admit fewer streams. Unset, the pool and the pages are as before (#2415, part 1 of #1431). Thanks to @wojo.
+
 ## 1.2.7
 
 - GLM-5.3-Flash on CUDA: with `TF_GLM_LAYERS=N`, serve's start-up memory check counts the weights by tensor from the shard headers, only those the load reads (the first N layers, the MTP layer when drafts are on, the embedding, norm and head), where it counted every checkpoint file. A 20-layer thin load of the 163.6 GiB checkpoint now counts 66.6 GiB without drafts. Unset, the count is the files' as before (#2788, fixes #2745). Thanks to @wojo.
