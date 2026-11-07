@@ -128,6 +128,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - The CUDA Qwen3.5 lanes fill readout prompts in pieces for the joint schema head that follows: from row 0, each piece's final-norm rows go to the readout, 1,024 rows a piece unless the lane host caps it, as on HIP (#2384, part of #2324). Thanks to @laudney.
 
+- GLM-5.3-Flash on CUDA: `--learn-conversations` keeps kept prompt states on disk, every rank's part in rank 0's store, so a conversation resumes after its in-memory state is evicted or the server restarts; a damaged file is refused by name, and the turn tries one shorter state, as after any refused disk read, then prefills. `--spill-gib` and `--checkpoint-slots` are refused for GLM, and so is `TF_KV_SHARE`, whose prefix pages lie outside the lease the image reads. Off: nothing changes (#1411). Thanks to @wojo.
+
 ## 1.2.4
 
 - Docs: four subcommand-flag fixes checked against the code: `slide audit --threshold`'s range, `benchmark --context` and `--kv-cache`, `info` on Flash Next, and `run --device` and `--carveout` on CUDA builds (#2348).
