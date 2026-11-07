@@ -4,7 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
-- GLM-5.3-Flash on CUDA: `--learn-conversations` keeps kept prompt states on disk, every rank's part in rank 0's store, so a conversation resumes after its in-memory state is evicted or the server restarts; a damaged file is refused by name, and the turn tries one shorter state, as after any refused disk read, then prefills. `--spill-gib` and `--checkpoint-slots` are refused for GLM, and so are `TF_KV_SHARE`, whose prefix pages lie outside the lease the image reads, and `TF_GLM_KV_LIVE_HALF=1`, whose keeps hold one KDA half where the image holds both. Off: nothing changes (#1411). Thanks to @wojo.
+- GLM-5.3-Flash on CUDA: `--learn-conversations` keeps kept prompt states on disk, every rank's part in rank 0's store, so a conversation resumes after its in-memory state is evicted or the server restarts; a damaged file, or one written by another number of ranks, is refused by name, and the turn tries one shorter state, as after any refused disk read, then prefills. `--spill-gib` and `--checkpoint-slots` are refused for GLM, and so are `TF_KV_SHARE`, whose prefix pages lie outside the lease the image reads, and `TF_GLM_KV_LIVE_HALF=1`, whose keeps hold one KDA half where the image holds both. Off: nothing changes (#1411). Thanks to @wojo.
 
 ## 1.2.6
 
