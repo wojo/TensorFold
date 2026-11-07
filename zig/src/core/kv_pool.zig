@@ -1,6 +1,7 @@
 //! One pool of KV pages for every stream: a family's layout, page ids and their holders, and the streams' leases.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const owners = @import("kv_pool_classes.zig");
 
 /// A family's stream memory: a fixed part at any length, paged caches a token, and a kept snapshot's slot.
 pub const Layout = struct {
@@ -14,6 +15,8 @@ pub const Layout = struct {
     snap_bytes: u64,
     /// Bytes a running stream takes from the pages beside its keys and values, as one run of whole pages (0: none).
     run_bytes: u64 = 0,
+    /// Owner classes: ids c, c + W, c + 2W ... form class c, and a lease takes every id from one (1: today's pool).
+    classes: u32 = 1,
 
     pub fn pageBytes(l: Layout) u64 {
         return l.token_bytes * l.page_tokens;
@@ -115,6 +118,9 @@ pub fn plan(l: Layout, b: Budget) error{ NoStream, TooMany }!Plan {
     return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min((left + own) / l.pageBytes(), most)), .kept = kept, .taken = taken };
 }
 
+/// `plan` over `l.classes` owner classes (kv_pool_classes.zig).
+pub const planClasses = owners.plan;
+
 /// Whether `b.cache` fits whole in what `plan` leaves it: the room past the engine and a fixed part and page a stream.
 pub fn holds(l: Layout, b: Budget) bool {
     const own = ownPages(l, b);
@@ -146,6 +152,7 @@ fn ownPages(l: Layout, b: Budget) u64 {
 pub const Lease = struct {
     promised: usize = 0,
     ids: std.ArrayList(u32) = .empty,
+    owner: u32 = 0, // the class its ids come from (id % classes == owner); finish resets it
 };
 
 /// Where a stream's page table goes on the device: `ids[from..]` written at entry `from`.
@@ -175,6 +182,9 @@ pub const Notify = struct {
 /// A family's pool as the load ledger reads it: tokens a page, and the contiguous run it needs (0: none).
 pub const Source = struct { pool: *Pool, page_tokens: u32, run_pages: u32 = 0 };
 
+/// Owner classes a pool holds at most (kv_pool_classes.zig).
+pub const max_classes = owners.max;
+
 /// What an idle pool must show: nothing promised, every page free or the store's alone.
 pub const Census = struct { total: usize, free: usize, promised: usize, kept: usize, leased: usize };
 
@@ -194,8 +204,21 @@ pub const Pool = struct {
     notify: ?Notify = null,
     ledger: ?Gate = null, // the lane host's ledger, the only test a promise passes; null: the pool's own pages
     depth: u8 = 0, // public changes in progress: the outermost one notifies, after nested calls and rollbacks
+    classes: u32 = 1, // owner classes (DeepSeek's residues): page id c + k * classes is class c's
+    cap: usize = 0, // ids a class holds
+    cfree: [max_classes]usize = @splat(0), // class c's free stack is free[c * cap ..][0..cfree[c]]; nfree their sum
+    cpromised: [max_classes]usize = @splat(0), // promised to class c's leases; promised their sum
 
     pub fn init(gpa: Allocator, count: usize, page_bytes: u64) !Pool {
+        return initClasses(gpa, count, page_bytes, 1) catch |e| switch (e) {
+            error.BadClasses => unreachable, // one class holds any count
+            error.OutOfMemory => |x| x,
+        };
+    }
+
+    /// `count` ids in `classes` owner classes (1 to max_classes): class c's ids c, c + classes ..., lowest on top.
+    pub fn initClasses(gpa: Allocator, count: usize, page_bytes: u64, classes: u32) !Pool {
+        if (classes == 0 or classes > max_classes or count % classes != 0) return error.BadClasses;
         const refs = try gpa.alloc(u32, count);
         errdefer gpa.free(refs);
         const leased = try gpa.alloc(u32, count);
@@ -203,8 +226,11 @@ pub const Pool = struct {
         const free = try gpa.alloc(u32, count);
         @memset(refs, 0);
         @memset(leased, 0);
-        for (free, 0..) |*f, i| f.* = @intCast(count - 1 - i); // page 0 taken first
-        return .{ .gpa = gpa, .refs = refs, .leased = leased, .free = free, .nfree = count, .page_bytes = page_bytes };
+        const cap = count / classes;
+        for (free, 0..) |*f, i| f.* = @intCast((cap - 1 - i % cap) * classes + i / cap); // page 0 taken first
+        var p: Pool = .{ .gpa = gpa, .refs = refs, .leased = leased, .free = free, .nfree = count, .page_bytes = page_bytes, .classes = classes, .cap = cap };
+        @memset(p.cfree[0..classes], cap);
+        return p;
     }
 
     pub fn deinit(p: *Pool) void {
@@ -222,6 +248,14 @@ pub const Pool = struct {
     pub fn available(p: *const Pool) usize {
         return p.nfree - p.promised;
     }
+
+    // Owner classes (kv_pool_classes.zig): one class is today's pool, id for id.
+    pub const classCap = owners.classCap;
+    pub const classFree = owners.classFree;
+    pub const classPromised = owners.classPromised;
+    pub const availableIn = owners.availableIn;
+    pub const roomiest = owners.roomiest;
+    pub const fitsAny = owners.fitsAny;
 
     /// Pages the store alone holds: evicting its idle leaves frees them.
     pub fn reclaimable(p: *const Pool) usize {
@@ -265,8 +299,7 @@ pub const Pool = struct {
         if (p.leased[id] == 0 or p.refs[id] < p.leased[id]) std.debug.panic("kv pool: page {d} released with no holder", .{id});
         p.ownership(id, p.refs[id] - 1, p.leased[id] - 1);
         if (p.refs[id] > 0) return;
-        p.free[p.nfree] = id;
-        p.nfree += 1;
+        owners.push(p, id);
     }
 
     pub fn idle(p: *const Pool) bool {
@@ -301,8 +334,7 @@ pub const Pool = struct {
         if (p.refs[id] <= p.leased[id]) return error.NotHeld; // no holder past the leases' (callers drop theirs first)
         p.ownership(id, p.refs[id] - 1, p.leased[id]);
         if (p.refs[id] > 0) return;
-        p.free[p.nfree] = id;
-        p.nfree += 1;
+        owners.push(p, id);
     }
 
     /// Promise `n` more pages to `l`, the store reclaiming first if it must; LaneMemory when they do not fit.
@@ -313,7 +345,9 @@ pub const Pool = struct {
             _ = r.call(r.ctx, p.want(n));
         };
         if (p.available() < p.want(n)) return error.LaneMemory;
+        if (p.classes > 1 and p.availableIn(l.owner) < n) return error.LaneMemory; // its class lacks them
         p.promised += n; // a sub-count of the ledger's: it passed the ledger's test above, never a second one
+        p.cpromised[l.owner] += n;
         l.promised += n;
     }
 
@@ -325,9 +359,10 @@ pub const Pool = struct {
             _ = r.call(r.ctx, p.want(out.len));
         };
         if (p.available() < p.want(out.len)) return false;
+        const c = p.roomiest(); // above one class: all from one, as a lease's
+        if (p.classes > 1 and p.availableIn(c) < out.len) return false;
         for (out) |*id| {
-            p.nfree -= 1;
-            id.* = p.free[p.nfree];
+            id.* = owners.pop(p, c);
             p.ownership(id.*, 1, 0);
         }
         return true;
@@ -338,6 +373,7 @@ pub const Pool = struct {
         p.enter();
         defer p.leave();
         p.promised -= l.promised;
+        p.cpromised[l.owner] -= l.promised;
         l.promised = 0;
     }
 
@@ -347,11 +383,11 @@ pub const Pool = struct {
         defer p.leave();
         if (l.promised == 0) return error.PastReservation;
         try l.ids.ensureUnusedCapacity(p.gpa, 1);
-        p.nfree -= 1;
-        const id = p.free[p.nfree];
+        const id = owners.pop(p, l.owner);
         p.ownership(id, 1, 1);
         l.promised -= 1;
         p.promised -= 1;
+        p.cpromised[l.owner] -= 1;
         l.ids.appendAssumeCapacity(id);
         return id;
     }
@@ -360,6 +396,7 @@ pub const Pool = struct {
     pub fn adopt(p: *Pool, l: *Lease, ids: []const u32) error{OutOfMemory}!void {
         p.enter();
         defer p.leave();
+        for (ids) |id| owners.owned(p, l, id);
         l.ids.appendSlice(p.gpa, ids) catch |e| {
             for (ids) |id| p.release(id);
             return e;
@@ -373,6 +410,7 @@ pub const Pool = struct {
         defer p.leave();
         const old = l.ids.items[i];
         if (old == id) return;
+        owners.owned(p, l, id);
         p.retain(id);
         p.ownership(id, p.refs[id], p.leased[id] + 1);
         l.ids.items[i] = id;
@@ -393,7 +431,7 @@ pub const Pool = struct {
     pub fn coverRun(p: *Pool, l: *Lease, n: usize, step: usize, table: ?Table) !void {
         p.enter();
         defer p.leave();
-        if (l.ids.items.len > 0 or n == 0 or l.promised < n) return p.cover(l, n, table);
+        if (l.ids.items.len > 0 or n == 0 or l.promised < n or p.classes > 1) return p.cover(l, n, table);
         try l.ids.ensureTotalCapacity(p.gpa, n);
         const start = p.findAligned(n, step) orelse return p.cover(l, n, table);
         p.claimAt(l, start, n);
@@ -416,6 +454,7 @@ pub const Pool = struct {
             p.unlease(id);
             l.promised += 1;
             p.promised += 1;
+            p.cpromised[l.owner] += 1;
         }
     }
 
@@ -447,7 +486,7 @@ pub const Pool = struct {
     pub fn claimRun(p: *Pool, l: *Lease, k: usize) ?u32 {
         p.enter();
         defer p.leave();
-        if (l.promised < k) return null;
+        if (l.promised < k or p.classes > 1) return null; // a run spans every class
         const start = p.findRun(k) orelse return null;
         p.claimAt(l, start, k);
         return start;
@@ -462,11 +501,13 @@ pub const Pool = struct {
         };
         std.debug.assert(n + k == p.nfree);
         p.nfree = n;
+        p.cfree[0] = n; // one class: runs are refused above it
         @memset(p.refs[start..][0..k], 1);
         @memset(p.leased[start..][0..k], 1); // held as a lease holds its pages: never the store's to reclaim
         p.nleased += k; // every page in this free run gained its first lease and no other holder
         l.promised -= k;
         p.promised -= k;
+        p.cpromised[0] -= k;
     }
 
     /// A run claimed at `start` goes back to the free pages.
@@ -476,8 +517,7 @@ pub const Pool = struct {
         for (start..start + k) |id| {
             if (p.refs[id] != 1 or p.leased[id] != 1) std.debug.panic("kv pool: run page {d} released while not a run's", .{id});
             p.ownership(id, 0, 0);
-            p.free[p.nfree] = @intCast(id);
-            p.nfree += 1;
+            owners.push(p, @intCast(id));
         }
     }
 
@@ -506,4 +546,7 @@ test {
     _ = @import("kv_pool_counts_test.zig");
     _ = @import("kv_pool_walk_test.zig");
     _ = @import("kv_pool_notify_test.zig");
+    _ = @import("kv_pool_classes.zig");
+    _ = @import("kv_pool_class_test.zig");
+    _ = @import("kv_pool_trace_test.zig");
 }
