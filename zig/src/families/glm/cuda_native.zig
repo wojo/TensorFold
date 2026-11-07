@@ -45,6 +45,7 @@ pub const Options = struct {
     drafter: ?[]const u8 = null, // --drafter: DFlash2's folder (the same on every rank; needs drafts on)
     drafter_bits: u8 = 4, // --drafter-bits: 4 (default) or 0 (bf16)
     mtp_confidence: ?f64 = null, // --mtp-confidence: rank 0's lanes stop an MTP chain where its chance falls under it
+    keeps: bool = false, // the server keeps prompt states: a prompt cache (--prompt-cache-gib, 16 unset) or a disk tier
 };
 /// --drafter: DFlash2 (incoai/GLM-5.3-Flash-DFlash2, non-commercial weights) drafts instead of the MTP head.
 pub const takes_drafter = true;
@@ -219,6 +220,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     if (a.share > 0 and !set.pages) return error.GlmShareNeedsPages;
     if (@import("cuda_kv_host.zig").onHost() and !set.pages) return error.GlmKvHostNeedsPages;
     if (set.kv_split and a.share > 0) return error.KvSplitShare; // the store's pages would be of any owner's class
+    if (set.kv_split and o.keeps) return error.KvSplitKeeps; // a kept state copies latent rows only their owner holds
     cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -416,6 +418,7 @@ pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaq
     _ = owner;
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
     if (e.pos() != at) return error.NotAtMark;
+    if (e.settings.kv_split) return error.KvSplitKeeps; // refused at start; never a state of rows another rank holds
     const k = try e.gpa.create(engine.Kept);
     errdefer e.gpa.destroy(k);
     k.* = .{ .id = try e.keepState(), .at = at };
@@ -499,6 +502,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.KvSplitNeedsPages => "TF_GLM_KV_SPLIT needs KV pages: unset TF_KV_PAGES or set it to auto or on (fp8 KV keeps windows)",
         error.KvSplitOnHost => "TF_GLM_KV_SPLIT keeps the KV pages on the device: unset TF_GLM_KV_HOST",
         error.KvSplitShare => "TF_GLM_KV_SPLIT books each stream's pages from its owner's class, and TF_KV_SHARE's pages come from any: unset one",
+        error.KvSplitKeeps => "TF_GLM_KV_SPLIT keeps each stream's latent rows on one rank, and kept prompt states do not carry them yet: serve with --prompt-cache-gib 0 and without --learn-conversations, or without TF_GLM_KV_SPLIT",
+        error.KvSplitRoom, error.KvSplitNoRoom, error.KvSplitLocal => "TF_GLM_KV_SPLIT: a forward over owner-only rows had no room to exchange them (a bug: the log names the step)",
         error.ClassTooSmall => "TF_GLM_KV_SPLIT: one owner class of the KV pages holds less than one stream's window (the log gives the numbers): lower --context, raise --parallel, or serve without TF_GLM_KV_SPLIT",
         error.ResidueMismatch => "a rank was sent a KV page of another owner's class (a bug: the ranks' books disagree)",
         error.BadClasses => "the KV pages do not split into the owner classes (a multiple of the ranks, at most 16)",
@@ -550,7 +555,7 @@ test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank c
     }
     try std.testing.expect(explain(null, error.Fp8OnPages) != null);
     try std.testing.expect(explain(null, error.GlmKvHostNeedsPages) != null);
-    for ([_]anyerror{ error.KvSplitNeedsRanks, error.KvSplitNeedsPages, error.KvSplitOnHost, error.KvSplitShare, error.ClassTooSmall, error.ResidueMismatch, error.BadClasses }) |e| try std.testing.expect(explain(null, e) != null);
+    for ([_]anyerror{ error.KvSplitNeedsRanks, error.KvSplitNeedsPages, error.KvSplitOnHost, error.KvSplitShare, error.KvSplitKeeps, error.KvSplitRoom, error.ClassTooSmall, error.ResidueMismatch, error.BadClasses }) |e| try std.testing.expect(explain(null, e) != null);
 }
 
 test "capacity keeps a verify window past the context and a multiple of 64" {
