@@ -41,6 +41,8 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
     if (comptime @hasField(F.Options, "rope_yarn")) opts.rope_yarn = o.rope_yarn;
     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
+    // GLM's TF_GLM_KV_SPLIT refuses kept states: a prompt cache (unset: on) or --learn-conversations' disk tier
+    if (@hasField(F.Options, "keeps")) opts.keeps = (o.prompt_cache_gib orelse 1) != 0 or o.learn_conversations;
     if (@hasField(F.Options, "prompt_int8")) opts.prompt_int8 = o.prompt_int8;
     if (@hasField(F.Options, "loops")) opts.loops = o.loops;
     if (@hasField(F.Options, "learn_conversations")) opts.learn_conversations = o.learn_conversations;
