@@ -169,12 +169,18 @@ pub fn budgetOf(comptime F: type, l: kv_pool.Layout, room: u64, o: api.Open, win
     if (out.asked or host_mode or comptime keepsNoPrompts(F)) return out;
     var probe = out;
     probe.cache = std.math.maxInt(u64);
-    const all = kv_pool.plan(l, probe) catch return out;
+    var w = l; // owner classes: the cache the unsplit pool leaves, set aside first, the split's saving all pages
+    if (l.classes > 1 and l.whole_bytes > 0) {
+        w.token_bytes = l.whole_bytes;
+        w.classes = 1;
+    }
+    const all = kv_pool.plan(w, probe) catch return out;
     const left = if (!engine_paged and out.window > 0)
-        room -| (@as(u64, all.lanes - 1) *| (l.fixed_bytes +| (l.pages(out.window) + l.runPages()) *| l.pageBytes()))
+        room -| (@as(u64, all.lanes - 1) *| (w.fixed_bytes +| (w.pages(out.window) + w.runPages()) *| w.pageBytes()))
     else
-        all.snaps * l.snap_bytes + all.copied + all.kept;
+        all.snaps * w.snap_bytes + all.copied + all.kept;
     out.cache = budget.cacheBytes(null, left, 0);
+    out.asked = w.classes != l.classes; // before every window but the engine's own, as --prompt-cache-gib would be
     return out;
 }
 
