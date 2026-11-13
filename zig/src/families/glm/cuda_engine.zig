@@ -202,7 +202,7 @@ pub const Engine = struct {
         errdefer e.bp.deinit();
         if (o.settings.solo and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ fw.solo_rows, fw.prefill_rows });
         if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
-        if (o.settings.kv_split and rank == 0) std.log.info("glm: PROTOTYPE kv split fast bits {d} (1 twin pieces, 2 fetch pieces, 4 exchange pieces, 8 twin pairs, 16 fetch pairs, 32 no twins), pair {}", .{ o.settings.kv_split_fast, pair });
+        if (o.settings.kv_split and rank == 0) std.log.info("glm: PROTOTYPE kv split fast bits {d} (1 twin pieces, 2 fetch pieces, 4 exchange pieces, 8 twin pairs, 16 fetch pairs, 32 no twins, 64 window exchanges as gathers), pair {}", .{ o.settings.kv_split_fast, pair });
         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
         errdefer if (e.pair) |*p| p.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -213,6 +213,7 @@ pub const Engine = struct {
         errdefer if (e.bs) |*b| b.deinit();
         if (o.settings.kv_split) e.room = try @import("cuda_owner_attn.zig").Room.init(d, &e.c, rank, world, @max(e.bp.rows, shared_rows), lib, comm); // before the room is read
         errdefer if (e.room) |*r| r.deinit();
+        if (e.room) |*r| r.fast = o.settings.kv_split_fast & 64 != 0; // PROTOTYPE
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
         errdefer e.pairs.free();
         try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero

@@ -6,6 +6,7 @@ const dsa_block = @import("cuda_dsa_block.zig");
 const latent = @import("cuda_latent.zig");
 const shard = @import("cuda_shard.zig");
 const config = @import("config.zig");
+const tp = @import("tp");
 
 /// The most ranks a room holds heads for (cuda_ranks.max_world).
 pub const max_world = 16;
@@ -29,6 +30,8 @@ pub const Buf = enum { qa, ol, pq, po };
 pub const Pass = union(enum) { own, peer: usize, none };
 pub const Dir = enum { send, recv };
 pub const Edge = enum { begin, end };
+/// PROTOTYPE bit 64: a window's two exchanges as all-gathers (the group's one-shot RoCE writes when they fit).
+pub const Phase = enum { queries, outputs };
 
 /// Whether any segment exchanges rows (else the layer runs as before the split, with no exchange posted).
 pub fn exchanges(segs: []const Seg) bool {
@@ -42,14 +45,19 @@ pub fn run(comptime D: type, d: D, segs: []const Seg, rank: usize, world: usize)
         for (segs) |g| try d.attend(g, .own);
         return;
     }
+    const fast = if (@hasDecl(D, "gathers")) d.gathers(segs) else false; // PROTOTYPE bit 64
     // 1. queries, each give segment's rows to its owner and each take segment's from every other rank, in order
-    try d.group(.begin);
-    for (segs) |g| switch (role(g.owner, rank)) {
-        .give => try d.move(.qa, g.owner.?, g, .send),
-        .take => for (0..world) |p| if (p != rank) try d.move(.pq, p, g, .recv),
-        .local => {},
-    };
-    try d.group(.end);
+    if (fast) {
+        if (@hasDecl(D, "gathers")) try d.gather(.queries, segs[0]);
+    } else {
+        try d.group(.begin);
+        for (segs) |g| switch (role(g.owner, rank)) {
+            .give => try d.move(.qa, g.owner.?, g, .send),
+            .take => for (0..world) |p| if (p != rank) try d.move(.pq, p, g, .recv),
+            .local => {},
+        };
+        try d.group(.end);
+    }
     // 2. local: its own heads; take: its own, then each other rank's; give: its writes and token lists alone
     for (segs) |g| switch (role(g.owner, rank)) {
         .local => try d.attend(g, .own),
@@ -60,6 +68,10 @@ pub fn run(comptime D: type, d: D, segs: []const Seg, rank: usize, world: usize)
         .give => try d.attend(g, .none),
     };
     // 3. outputs: each take segment's rows of rank p's heads back to p; each give segment's into its own `ol`
+    if (fast) {
+        if (@hasDecl(D, "gathers")) try d.gather(.outputs, segs[0]);
+        return;
+    }
     try d.group(.begin);
     for (segs) |g| switch (role(g.owner, rank)) {
         .take => for (0..world) |p| if (p != rank) try d.move(.po, if (mut(.output_to_owner)) rank else p, g, .send),
@@ -83,6 +95,8 @@ pub const Room = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
     stats: Stats = .{},
+    stage: ?cuda.DeviceBuffer = null, // PROTOTYPE bit 64: a window's gather, [world][window rows][heads x lw bf16]
+    fast: bool = false, // PROTOTYPE bit 64
 
     /// Bytes a room of `rows` rows takes on a rank of `world`: two slots of the widest share for each other rank.
     pub fn bytes(c: *const config.Config, world: usize, rows: usize) !usize {
@@ -93,10 +107,12 @@ pub const Room = struct {
         if (world < 2 or world > max_world) return error.KvSplitNeedsRanks;
         var r: Room = .{ .buf = try cuda.DeviceBuffer.alloc(d, try bytes(c, world, rows)), .rank = rank, .world = world, .rows = rows, .lw = c.kv_lora, .heads = @splat(0), .lib = lib, .comm = comm };
         for (r.heads[0..world], 0..) |*h, p| h.* = (try shard.Share.of(c, p, world)).mla.len();
+        r.stage = try cuda.DeviceBuffer.alloc(d, world * fw.window_rows * r.heads[0] * r.lw * 2); // PROTOTYPE
         return r;
     }
 
     pub fn deinit(r: *Room) void {
+        if (r.stage) |*s| s.free();
         r.buf.free();
     }
 
@@ -167,6 +183,41 @@ const Gpu = struct {
             .recv => try lib.check(lib.api.ncclRecv(ptr, n, .u8, @intCast(p), r.comm, g.f.stream.handle), "ncclRecv"),
         }
         if (dir == .send) r.stats.bytes += n;
+    }
+
+    /// PROTOTYPE bit 64: one owned segment of a window at two ranks, small enough for the stage.
+    pub fn gathers(g: Gpu, segs: []const Seg) bool {
+        const r = g.room;
+        const stage = r.stage orelse return false;
+        if (!r.fast or g.b.prefill or g.last != null or r.world != 2 or segs.len != 1 or r.heads[0] != r.heads[1]) return false;
+        if (segs[0].owner == null) return false;
+        const n = segs[0].rows * r.rowBytes(0);
+        if (n == 0 or n % 16 != 0 or 2 * n > stage.len) return false;
+        return switch (g.f.exchange) {
+            .nccl => |x| x.collective != null,
+            .local => false,
+        };
+    }
+
+    /// PROTOTYPE bit 64: the giver's queries to the owner, or the owner's outputs back, as one all-gather.
+    pub fn gather(g: Gpu, what: Phase, s: Seg) !void {
+        const r = g.room;
+        const stage = r.stage.?;
+        const owner: usize = s.owner.?;
+        const peer: usize = 1 - owner;
+        const n = s.rows * r.rowBytes(0);
+        const qa = g.b.dsa.qa + s.row0 * r.rowBytes(r.rank);
+        const mine: u64 = if (what == .outputs and r.rank == owner) r.at(.po, peer, s.row0) else qa; // else filler
+        const coll = switch (g.f.exchange) {
+            .nccl => |x| x.collective.?,
+            .local => return error.KvSplitLocal,
+        };
+        coll.allGather(mine, stage.ptr, n / 4, .f32, g.f.stream.handle) catch |e| return tp.group.underlying(coll, e);
+        switch (what) {
+            .queries => if (r.rank == owner) try g.f.copy(g.f.stream, r.at(.pq, peer, s.row0), stage.ptr + peer * n, n),
+            .outputs => if (r.rank != owner) try g.f.copy(g.f.stream, g.b.dsa.ol + s.row0 * r.rowBytes(r.rank), stage.ptr + owner * n, n),
+        }
+        if ((what == .queries) == (r.rank != owner)) r.stats.bytes += n;
     }
 
     pub fn attend(g: Gpu, s: Seg, pass: Pass) !void {
