@@ -46,6 +46,9 @@ pub fn run(comptime D: type, d: D, segs: []const Seg, rank: usize, world: usize)
         return;
     }
     const fast = if (@hasDecl(D, "gathers")) d.gathers(segs) else false; // PROTOTYPE bit 64
+    // PROTOTYPE bit 128: one owned segment's owner attends its own heads while the other rank's queries are on the way
+    const early = (if (@hasDecl(D, "early")) d.early(segs) else false) and role(segs[0].owner, rank) == .take;
+    if (early) try d.attend(segs[0], .own);
     // 1. queries, each give segment's rows to its owner and each take segment's from every other rank, in order
     if (fast) {
         if (@hasDecl(D, "gathers")) try d.gather(.queries, segs[0]);
@@ -62,7 +65,7 @@ pub fn run(comptime D: type, d: D, segs: []const Seg, rank: usize, world: usize)
     for (segs) |g| switch (role(g.owner, rank)) {
         .local => try d.attend(g, .own),
         .take => {
-            try d.attend(g, .own);
+            if (!early) try d.attend(g, .own);
             if (!mut(.peer_skipped)) for (0..world) |p| if (p != rank) try d.attend(g, .{ .peer = p });
         },
         .give => try d.attend(g, .none),
@@ -82,7 +85,7 @@ pub fn run(comptime D: type, d: D, segs: []const Seg, rank: usize, world: usize)
 }
 
 /// Exchange counts since start (rank 0's appear in glm-paged-check's receipt); fetches: cuda_owner_fetch's layers.
-pub const Stats = struct { layers: u64 = 0, rows: u64 = 0, bytes: u64 = 0, fetches: u64 = 0, fetched: u64 = 0, fetch_bytes: u64 = 0 };
+pub const Stats = struct { layers: u64 = 0, rows: u64 = 0, bytes: u64 = 0, fetches: u64 = 0, fetched: u64 = 0, fetch_bytes: u64 = 0, gathers: u64 = 0, early: u64 = 0 }; // PROTOTYPE: the last two
 
 /// The exchange room: each other rank's queries and the outputs computed for it, `rows` rows of its heads a slot.
 pub const Room = struct {
@@ -97,6 +100,7 @@ pub const Room = struct {
     stats: Stats = .{},
     stage: ?cuda.DeviceBuffer = null, // PROTOTYPE bit 64: a window's gather, [world][window rows][heads x lw bf16]
     fast: bool = false, // PROTOTYPE bit 64
+    early: bool = false, // PROTOTYPE bit 128
 
     /// Bytes a room of `rows` rows takes on a rank of `world`: two slots of the widest share for each other rank.
     pub fn bytes(c: *const config.Config, world: usize, rows: usize) !usize {
@@ -213,11 +217,22 @@ const Gpu = struct {
             .local => return error.KvSplitLocal,
         };
         coll.allGather(mine, stage.ptr, n / 4, .f32, g.f.stream.handle) catch |e| return tp.group.underlying(coll, e);
+        r.stats.gathers += 1;
+        if (r.stats.gathers == 1 or r.stats.gathers % 16384 == 0) std.log.info("glm: PROTOTYPE kv split gather {d}: {s}, {d} bytes a rank", .{ r.stats.gathers, @tagName(what), n });
         switch (what) {
             .queries => if (r.rank == owner) try g.f.copy(g.f.stream, r.at(.pq, peer, s.row0), stage.ptr + peer * n, n),
             .outputs => if (r.rank != owner) try g.f.copy(g.f.stream, g.b.dsa.ol + s.row0 * r.rowBytes(r.rank), stage.ptr + owner * n, n),
         }
         if ((what == .queries) == (r.rank != owner)) r.stats.bytes += n;
+    }
+
+    /// PROTOTYPE bit 128: a decode or verify window of one owned segment (its owner's own pass goes first).
+    pub fn early(g: Gpu, segs: []const Seg) bool {
+        const r = g.room;
+        if (!r.early or g.b.prefill or g.last != null or segs.len != 1 or segs[0].owner == null) return false;
+        r.stats.early += 1;
+        if (r.stats.early == 1 or r.stats.early % 16384 == 0) std.log.info("glm: PROTOTYPE kv split early own pass {d} (owner rank {d})", .{ r.stats.early, segs[0].owner.? });
+        return true;
     }
 
     pub fn attend(g: Gpu, s: Seg, pass: Pass) !void {
