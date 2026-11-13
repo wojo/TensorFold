@@ -159,7 +159,7 @@ pub const Engine = struct {
         const block32 = !exl3.isExl3(gpa, text) and try @import("cuda_experts.zig").wantsBlock32(gpa, text);
         var m = try fw.Modules.load(d, ctx, block32);
         errdefer m.deinit();
-        const pair = prompt_pair.wanted(o.settings.pair and !o.settings.kv_split, o.settings.solo, world); // split: one stream's exchanges
+        const pair = prompt_pair.wanted(o.settings.pair and (!o.settings.kv_split or o.settings.kv_split_fast & 24 != 0), o.settings.solo, world); // PROTOTYPE: bits 8, 16
         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
@@ -202,6 +202,7 @@ pub const Engine = struct {
         errdefer e.bp.deinit();
         if (o.settings.solo and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ fw.solo_rows, fw.prefill_rows });
         if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
+        if (o.settings.kv_split and rank == 0) std.log.info("glm: PROTOTYPE kv split fast bits {d} (1 twin pieces, 2 fetch pieces, 4 exchange pieces, 8 twin pairs, 16 fetch pairs, 32 no twins), pair {}", .{ o.settings.kv_split_fast, pair });
         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
         errdefer if (e.pair) |*p| p.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -388,6 +389,7 @@ pub const Engine = struct {
         if (rows > fw.prefill_rows and !prompt_solo.allowed(e, start, rows)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bp, &one);
+        if (e.room != null and prompt_pair.splitPieces(e, start, rows)) f.pieces = &e.pieces; // PROTOTYPE
         f.index_split = split;
         if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
         const as_i32: []const i32 = @ptrCast(part);

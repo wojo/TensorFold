@@ -59,12 +59,59 @@ pub fn piecesOf(e: *const Engine, b: *const fw.Buffers) ?*const fw.Pieces {
     return if (b == &p.bp) &p.pieces else null;
 }
 
+/// PROTOTYPE: how a TF_GLM_KV_SPLIT prompt chunk of `rows` at `host_pos` attends (host values, alike on every rank).
+pub const SplitMode = enum { unsplit, twin, fetch, exchange };
+
+pub fn splitMode(e: *const Engine, host_pos: usize, rows: usize) SplitMode {
+    const room = if (e.room) |*r| r else return .unsplit;
+    const owner = e.cur.st.attends() orelse return .twin; // a twin, or rows every rank holds: each attends its own heads
+    const fetch = @import("cuda_owner_fetch.zig");
+    var lw: usize = 0;
+    for (e.w.layers) |l| switch (l.mixer) {
+        .mla => |a| {
+            lw = a.lw;
+            break;
+        },
+        else => {},
+    };
+    if (lw == 0) return .exchange;
+    return if (fetch.fetches(true, owner, host_pos, rows, fetch.roomRows(room.buf.len, lw), room.away(owner))) .fetch else .exchange;
+}
+
+/// PROTOTYPE: whether that chunk's exchanges go in row pieces (TF_GLM_KV_SPLIT_FAST bits 1 twin, 2 fetch, 4 exchange).
+pub fn splitPieces(e: *const Engine, host_pos: usize, rows: usize) bool {
+    const bits = e.settings.kv_split_fast;
+    return switch (splitMode(e, host_pos, rows)) {
+        .unsplit => true,
+        .twin => bits & 1 != 0,
+        .fetch => bits & 2 != 0,
+        .exchange => bits & 4 != 0,
+    };
+}
+
+/// PROTOTYPE: whether chunks `ra` at `start` and `rb` after it may pair (bits 8 twin, 16 fetch), both in pieces.
+pub fn splitPairs(e: *const Engine, start: usize, ra: usize, rb: usize) bool {
+    if (e.room == null) return true;
+    const bits = e.settings.kv_split_fast;
+    for ([_][2]usize{ .{ start, ra }, .{ start + ra, rb } }) |c| {
+        const ok = switch (splitMode(e, c[0], c[1])) {
+            .unsplit => true,
+            .twin => bits & 8 != 0,
+            .fetch => bits & 16 != 0,
+            .exchange => false,
+        };
+        if (!ok or !splitPieces(e, c[0], c[1])) return false;
+    }
+    return true;
+}
+
 /// Rank 0's choice for the step at `start` (the others take the ids it sends); not with a drafter, prompt rows or prof.
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
     if (e.pair == null or !e.settings.pair or e.drafter != null or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.cur.cuts.items.len > 0) return false; // a paired step would step over a request start
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
+    if (!splitPairs(e, start, fw.prefill_rows, @min(len - start - fw.prefill_rows, fw.prefill_rows))) return false; // PROTOTYPE
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
     return ringsAgree(base, e.cur.st.ring_rows, start, @min(len - start - fw.prefill_rows, fw.prefill_rows));
@@ -78,6 +125,7 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     const pair = if (e.pair) |*p| p else return error.BadChunk;
     if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.drafter != null or e.prompt_logprobs != null) return error.BadChunk;
     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
+    if (!splitPairs(e, start, ra, rb)) return error.BadChunk; // PROTOTYPE: likewise
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     e.gate(cancel) catch |err| {
         if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
@@ -87,6 +135,10 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     var two: [1]fw.Rank = undefined;
     var fa = e.view(&e.bp, &one);
     var fb = e.view(&pair.bp, &two);
+    if (e.room != null) { // PROTOTYPE: splitPairs said both chunks take pieces
+        fa.pieces = &e.pieces;
+        fb.pieces = &pair.pieces;
+    }
     fa.prof = null;
     fb.prof = null;
     fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks

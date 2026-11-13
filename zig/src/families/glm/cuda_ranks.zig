@@ -29,6 +29,7 @@ pub const Settings = struct {
     kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
     kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
     kv_split: bool = false, // TF_GLM_KV_SPLIT: each stream's pages from one owner rank's class (`open` checks it)
+    kv_split_fast: u8 = 0, // PROTOTYPE TF_GLM_KV_SPLIT_FAST: bits for a split prompt pass (cuda_prompt_pair.splitMode)
     l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
     kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
 
@@ -180,6 +181,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
+        if (get("TF_GLM_KV_SPLIT_FAST")) |v| s.kv_split_fast = std.fmt.parseInt(u8, v, 10) catch 0; // PROTOTYPE
         // refused here, before the weights load: the wire's bootstrap meets at rank 0, its kernel comes from the image
         if (s.roce_multi and (get("TF_TP_MASTER") == null or get("TF_TP_KERNEL_IMAGE") == null)) {
             problem.* = "TF_GLM_ROCE_MULTI=1 requires TF_TP_MASTER and TF_TP_KERNEL_IMAGE";
